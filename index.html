@@ -73,7 +73,7 @@ $('saveTok').onclick = () => {
 };
 
 /* ---------- Настройки (запоминаются в браузере шлема) ---------- */
-const DEF = { hdriB: 1.5, hdriC: 1, rot: 0, exp: 1.2, con: 1, sat: 1, hue: 0, tmp: 0, tone: 0, map: '' };
+const DEF = { hdriB: 1.5, hdriC: 1, rot: 0, exp: 1.2, con: 1, sat: 1, hue: 0, tmp: 0, tone: 0, shadow: 1, shA: 0.55, shR: 3, map: '' };
 const S = { ...DEF };
 try { Object.assign(S, JSON.parse(localStorage.getItem('sf_s2') || '{}')); } catch {}
 const save = () => { try { localStorage.setItem('sf_s2', JSON.stringify(S)); } catch {} };
@@ -85,13 +85,41 @@ renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setClearColor(0x0b0c0e, 1);
 renderer.xr.enabled = true;
 renderer.xr.setReferenceSpaceType('local-floor');
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+renderer.shadowMap.autoUpdate = false;
 wrap.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
 const hemi = new THREE.HemisphereLight(0xffffff, 0x445566, 0.5);
 const sun = new THREE.DirectionalLight(0xffffff, 1.0);
 sun.position.set(2, 4, 3);
-scene.add(hemi, sun);
+scene.add(hemi, sun, sun.target);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.bias = -0.0003;
+const SUN_DIR = new THREE.Vector3(0.35, 1, 0.5).normalize();
+const shadowPlane = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.ShadowMaterial({ opacity: 0.55 }));
+shadowPlane.rotation.x = -Math.PI / 2;
+shadowPlane.receiveShadow = true;
+scene.add(shadowPlane);
+let shadowDirty = true;
+const lastM = new THREE.Matrix4();
+function updateShadow() {
+  if (!S.shadow) return;
+  holder.updateMatrixWorld();
+  if (lastM.equals(holder.matrixWorld) && !shadowDirty) return;
+  lastM.copy(holder.matrixWorld); shadowDirty = false;
+  const r = 0.55 * holder.scale.x, c = sun.shadow.camera, y = Math.max(holder.position.y, 0);
+  c.left = -r; c.right = r; c.top = r; c.bottom = -r;
+  const dist = r * 3 + 1;
+  sun.position.copy(holder.position).addScaledVector(SUN_DIR, dist);
+  sun.target.position.copy(holder.position);
+  c.near = 0.05; c.far = dist + y * 1.4 + r * 2 + 1;
+  c.updateProjectionMatrix();
+  sun.shadow.normalBias = 0.01 * r;
+  renderer.shadowMap.needsUpdate = true;
+}
 
 const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 50);
 const HOME = new THREE.Vector3(0, 1.0, -0.8);
@@ -167,6 +195,11 @@ function applyScene() {
   U.sat.value = S.sat;
   scene.environmentIntensity = S.hdriB;
   scene.environmentRotation.y = S.rot * Math.PI / 180;
+  shadowPlane.material.opacity = S.shA;
+  shadowPlane.visible = !!S.shadow;
+  sun.castShadow = !!S.shadow;
+  sun.shadow.radius = S.shR;
+  shadowDirty = true;
 }
 function bake() {
   let rt;
@@ -206,7 +239,8 @@ let hits = [], dirty = true, page = 0, tab = 0, msg = '', drag = null, rightC = 
 let maps = [{ name: 'Студия (встроенная)', file: '' }];
 const SL = {
   hdri: [['hdriB', 'Яркость HDRI', 0, 4], ['hdriC', 'Контраст HDRI', 0.5, 2], ['rot', 'Вращение карты', -180, 180]],
-  scene: [['exp', 'Яркость сцены', 0.2, 3], ['con', 'Контраст', 0.5, 2], ['sat', 'Насыщенность', 0, 2], ['hue', 'Оттенок', -180, 180], ['tmp', 'Температура', -1, 1]]
+  scene: [['exp', 'Яркость сцены', 0.2, 3], ['con', 'Контраст', 0.5, 2], ['sat', 'Насыщенность', 0, 2], ['hue', 'Оттенок', -180, 180], ['tmp', 'Температура', -1, 1]],
+  shadow: [['shA', 'Сила тени', 0, 1], ['shR', 'Мягкость тени', 1, 8]]
 };
 const TX = 24, TW = 812;
 function rr(x, y, w, h, r, f, s) { g.beginPath(); g.roundRect(x, y, w, h, r); if (f) { g.fillStyle = f; g.fill(); } if (s) { g.strokeStyle = s; g.lineWidth = 3; g.stroke(); } }
@@ -222,11 +256,18 @@ function slider(y, d) {
   hits.push({ r: [TX, y + 30, TW, 64], sl: d });
   btn([852, y + 34, 84, 54], '↺', 0, () => { S[k] = DEF[k]; applyScene(); if (k === 'hdriC') bake(); save(); }, 34);
 }
+function resetTab() {
+  const n = ['hdri', 'scene', 'shadow'][tab];
+  for (const d of SL[n]) S[d[0]] = DEF[d[0]];
+  if (tab === 1) S.tone = DEF.tone;
+  if (tab === 2) S.shadow = DEF.shadow;
+  applyScene(); if (tab === 0) bake(); save();
+}
 function draw() {
   g.clearRect(0, 0, CW, CH); hits = [];
   rr(2, 2, CW - 4, CH - 4, 28, '#1d2025f2', '#4cc9b0');
-  ['HDRI', 'Сцена'].forEach((n, i) => btn([24 + i * 468, 22, 444, 64], n, tab === i, () => { tab = i; }));
-  if (!tab) {
+  ['HDRI', 'Сцена', 'Тень'].forEach((n, i) => btn([24 + i * 308, 22, 296, 64], n, tab === i, () => { tab = i; }));
+  if (tab === 0) {
     const per = 4, pages = Math.max(1, Math.ceil(maps.length / per));
     page = Math.min(page, pages - 1);
     tx(`Карты HDRI: ${maps.length - 1}`, 24, 118, 28, '#9aa0aa');
@@ -237,12 +278,17 @@ function draw() {
     }
     maps.slice(page * per, page * per + per).forEach((m, i) => btn([24, 148 + i * 58, 912, 50], fit(m.name, 860), S.map === m.file, () => pickMap(m)));
     SL.hdri.forEach((d, i) => slider(384 + i * 90, d));
-    tx(fit(msg || (maps.length < 2 ? 'Положите .hdr/.exr рядом с index.html на GitHub' : ''), 880), 24, 694, 26, '#ff8a7a');
-  } else {
+    tx(fit(msg || (maps.length < 2 ? 'Положите .hdr/.exr рядом с index.html на GitHub' : ''), 660), 24, 694, 26, '#ff8a7a');
+  } else if (tab === 1) {
     SL.scene.forEach((d, i) => slider(104 + i * 90, d));
     btn([24, 590, 444, 60], `Тон-маппинг: ${S.tone ? 'вкл' : 'выкл'}`, S.tone, () => { S.tone = S.tone ? 0 : 1; applyScene(); save(); }, 28);
     btn([492, 590, 444, 60], `Высота: ${lockY === null ? 'свободна' : 'зафиксирована'}`, lockY !== null, toggleLock, 28);
+  } else {
+    btn([24, 120, 912, 64], `Тень: ${S.shadow ? 'вкл' : 'выкл'}`, S.shadow, () => { S.shadow = S.shadow ? 0 : 1; applyScene(); save(); }, 30);
+    SL.shadow.forEach((d, i) => slider(214 + i * 90, d));
+    tx('Тень падает на пол. Если тормозит — выключите.', 24, 460, 26, '#9aa0aa');
   }
+  btn(tab === 0 ? [716, 664, 220, 48] : [24, 660, 912, 50], 'Сбросить всё', 0, resetTab, 28);
 }
 
 const ray = new THREE.Raycaster(), pl = new THREE.Plane(), nrm = new THREE.Vector3(), tp = new THREE.Vector3(), tm = new THREE.Matrix4();
@@ -370,6 +416,7 @@ renderer.setAnimationLoop(() => {
   } else {
     holder.rotation.y += dt * 0.5;
   }
+  updateShadow();
   renderer.render(scene, camera);
 });
 
@@ -558,7 +605,8 @@ function show(obj) {
   obj.scale.multiplyScalar(k);
   obj.position.set(-c.x * k, -c.y * k, -c.z * k);
   holder.add(obj);
-  obj.traverse(n => { if (n.material) [].concat(n.material).forEach(patch); });
+  obj.traverse(n => { if (n.isMesh) n.castShadow = true; if (n.material) [].concat(n.material).forEach(patch); });
+  shadowDirty = true;
   holder.updateMatrixWorld(true);
   holder.userData.minY = new THREE.Box3().setFromObject(holder).min.y - holder.position.y;
   grounded = false; lockY = null;
