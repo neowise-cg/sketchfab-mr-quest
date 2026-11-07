@@ -43,6 +43,7 @@ main{display:grid;grid-template-columns:minmax(260px,1fr) minmax(300px,1fr);gap:
     <div id="wrap"></div>
     <div id="status">Выберите модель слева.</div>
     <button id="mr" disabled>Войти в MR</button>
+    <p id="hint" style="color:var(--dim);font-size:14px;margin:10px 0 0">В MR: курок — переносить, A — поставить на пол, левый стик — вращение, правый стик — размер.</p>
   </div>
 </main>
 
@@ -55,6 +56,7 @@ main{display:grid;grid-template-columns:minmax(260px,1fr) minmax(300px,1fr);gap:
 <script type="module">
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 
 const $ = id => document.getElementById(id);
 const statusEl = $('status');
@@ -77,8 +79,12 @@ renderer.xr.setReferenceSpaceType('local-floor');
 wrap.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.6));
-const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.04).texture;
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 0.6));
+const sun = new THREE.DirectionalLight(0xffffff, 1.4);
 sun.position.set(2, 4, 3);
 scene.add(sun);
 
@@ -103,11 +109,14 @@ resize();
 
 /* ---------- Управление в MR ---------- */
 let grab = null;
+let grounded = false, aPrev = false;
+const groundSnap = () => { holder.position.y = -holder.scale.x * (holder.userData.minY || 0); };
 const off = new THREE.Vector3();
 for (let i = 0; i < 2; i++) {
   const c = renderer.xr.getController(i);
   c.addEventListener('selectstart', () => {
     grab = c;
+    grounded = false;
     off.copy(holder.position);
     c.worldToLocal(off);
   });
@@ -125,14 +134,19 @@ renderer.setAnimationLoop(() => {
     }
     const s = renderer.xr.getSession();
     for (const src of s.inputSources) {
-      if (src.handedness === 'right' && src.gamepad) {
-        const a = src.gamepad.axes;
+      if (!src.gamepad) continue;
+      const a = src.gamepad.axes;
+      if (src.handedness === 'left') {
         holder.rotation.y += (a[2] || 0) * dt * 1.6;
+      } else if (src.handedness === 'right') {
         const k = 1 - (a[3] || 0) * dt * 0.9;
-        const ns = THREE.MathUtils.clamp(holder.scale.x * k, 0.05, 20);
-        holder.scale.setScalar(ns);
+        holder.scale.setScalar(THREE.MathUtils.clamp(holder.scale.x * k, 0.05, 20));
+        const aNow = !!(src.gamepad.buttons[4] && src.gamepad.buttons[4].pressed);
+        if (aNow && !aPrev) { grounded = true; }
+        aPrev = aNow;
       }
     }
+    if (grounded) groundSnap();
   } else {
     holder.rotation.y += dt * 0.5;
   }
@@ -264,6 +278,9 @@ function show(obj) {
   obj.scale.multiplyScalar(k);
   obj.position.set(-c.x * k, -c.y * k, -c.z * k);
   holder.add(obj);
+  holder.updateMatrixWorld(true);
+  holder.userData.minY = new THREE.Box3().setFromObject(holder).min.y - holder.position.y;
+  grounded = false;
 }
 </script>
 </body>
