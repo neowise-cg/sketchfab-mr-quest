@@ -73,7 +73,7 @@ $('saveTok').onclick = () => {
 };
 
 /* ---------- Настройки (запоминаются в браузере шлема) ---------- */
-const DEF = { hdriB: 1.5, hdriC: 1, rot: 0, exp: 1.2, con: 1, sat: 1, hue: 0, tmp: 0, tone: 0, shadow: 1, self: 1, shA: 0.55, shR: 3, shRot: 0, shB: 0.5, aoO: 0.7, aoF: 0.6, map: '' };
+const DEF = { hdriB: 1.5, hdriC: 1, rot: 0, exp: 1.2, con: 1, sat: 1, hue: 0, tmp: 0, tone: 0, hands: 1, shadow: 1, self: 1, shA: 0.55, shR: 3, shRot: 0, shB: 0.5, aoO: 0.7, aoF: 0.6, map: '' };
 const S = { ...DEF };
 try { Object.assign(S, JSON.parse(localStorage.getItem('sf_s2') || '{}')); } catch {}
 const save = () => { try { localStorage.setItem('sf_s2', JSON.stringify(S)); } catch {} };
@@ -288,7 +288,7 @@ function resetTab() {
 function draw() {
   g.clearRect(0, 0, CW, CH); hits = [];
   rr(2, 2, CW - 4, CH - 4, 28, '#1d2025f2', '#4cc9b0');
-  ['HDRI', 'Сцена', 'Тень'].forEach((n, i) => btn([24 + i * 308, 22, 296, 64], n, tab === i, () => { tab = i; }));
+  ['HDRI', 'Сцена', 'Тень', 'Руки'].forEach((n, i) => btn([24 + i * 231, 22, 219, 64], n, tab === i, () => { tab = i; }));
   if (tab === 0) {
     const per = 4, pages = Math.max(1, Math.ceil(maps.length / per));
     page = Math.min(page, pages - 1);
@@ -305,11 +305,18 @@ function draw() {
     SL.scene.forEach((d, i) => slider(104 + i * 90, d));
     btn([24, 590, 444, 60], `Тон-маппинг: ${S.tone ? 'вкл' : 'выкл'}`, S.tone, () => { S.tone = S.tone ? 0 : 1; applyScene(); save(); }, 28);
     btn([492, 590, 444, 60], `Высота: ${lockY === null ? 'свободна' : 'зафиксирована'}`, lockY !== null, toggleLock, 28);
-  } else {
+  } else if (tab === 2) {
     btn([24, 100, 296, 52], `Тень: ${S.shadow ? 'вкл' : 'выкл'}`, S.shadow, () => { S.shadow = S.shadow ? 0 : 1; applyScene(); save(); }, 26);
     btn([332, 100, 296, 52], `Самотени: ${S.self ? 'вкл' : 'выкл'}`, S.self, () => { S.self = S.self ? 0 : 1; applyScene(); save(); }, 26);
     btn([640, 100, 296, 52], 'Сбросить всё', 0, resetTab, 26);
     SL.shadow.forEach((d, i) => slider(164 + i * 84, d));
+  } else {
+    tx('Руки и контроллеры', 24, 130, 30, '#e8e9ec', 'left', 1);
+    [['Показывать', 1], ['Окклюзия', 2], ['Выкл', 0]].forEach(([n, v], i) => btn([24 + i * 308, 164, 296, 64], n, S.hands === v, () => { S.hands = v; applyHands(); save(); }, 28));
+    tx('Показывать — видны виртуальные руки и контроллеры.', 24, 280, 26, '#9aa0aa');
+    tx('Окклюзия — они невидимы, но закрывают модель: ваши', 24, 320, 26, '#9aa0aa');
+    tx('реальные руки и контроллеры остаются перед ней.', 24, 352, 26, '#9aa0aa');
+    tx('Руки без контроллеров появятся, когда Quest начнёт их отслеживать.', 24, 410, 26, '#9aa0aa');
   }
   if (tab < 2) btn(tab === 0 ? [716, 664, 220, 48] : [24, 660, 912, 50], 'Сбросить всё', 0, resetTab, 28);
 }
@@ -401,10 +408,43 @@ for (let i = 0; i < 2; i++) {
   scene.add(c);
 }
 
+/* ---------- Виртуальные руки и контроллеры ---------- */
+const handsRoot = new THREE.Group();
+scene.add(handsRoot);
+const occMat = new THREE.MeshBasicMaterial({ colorWrite: false });
+let frameN = 0;
+function applyHands() {
+  handsRoot.visible = S.hands !== 0;
+  handsRoot.traverse(n => {
+    if (!n.isMesh) return;
+    if (!n.userData.m0) n.userData.m0 = n.material;
+    n.material = S.hands === 2 ? occMat : n.userData.m0;
+    n.renderOrder = S.hands === 2 ? -1 : 0;
+  });
+}
+(async () => {
+  try {
+    const [{ XRControllerModelFactory }, { XRHandModelFactory }] = await Promise.all([
+      import('three/addons/webxr/XRControllerModelFactory.js'),
+      import('three/addons/webxr/XRHandModelFactory.js')
+    ]);
+    const cf = new XRControllerModelFactory(), hf = new XRHandModelFactory();
+    for (let i = 0; i < 2; i++) {
+      const grip = renderer.xr.getControllerGrip(i);
+      grip.add(cf.createControllerModel(grip));
+      handsRoot.add(grip);
+      const hand = renderer.xr.getHand(i);
+      hand.add(hf.createHandModel(hand, 'mesh'));
+      handsRoot.add(hand);
+    }
+  } catch (e) { console.warn('hands', e); }
+})();
+
 const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
   if (renderer.xr.isPresenting) {
+    if ((frameN++ & 31) === 0) applyHands();
     if (grab) { grab.updateMatrixWorld(true); holder.position.copy(off).applyMatrix4(grab.matrixWorld); }
     for (const src of renderer.xr.getSession().inputSources) {
       if (!src.gamepad) continue;
@@ -709,6 +749,7 @@ function show(obj) {
 
 applyScene();
 bake();
+applyHands();
 discover();
 </script>
 </body>
