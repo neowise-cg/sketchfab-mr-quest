@@ -73,7 +73,7 @@ $('saveTok').onclick = () => {
 };
 
 /* ---------- Настройки (запоминаются в браузере шлема) ---------- */
-const DEF = { hdriB: 1.5, hdriC: 1, rot: 0, exp: 1.2, con: 1, sat: 1, hue: 0, tmp: 0, tone: 0, shadow: 1, shA: 0.55, shR: 3, map: '' };
+const DEF = { hdriB: 1.5, hdriC: 1, rot: 0, exp: 1.2, con: 1, sat: 1, hue: 0, tmp: 0, tone: 0, shadow: 1, self: 1, shA: 0.55, shR: 3, shRot: 0, shB: 0.5, aoO: 0.7, aoF: 0.6, map: '' };
 const S = { ...DEF };
 try { Object.assign(S, JSON.parse(localStorage.getItem('sf_s2') || '{}')); } catch {}
 const save = () => { try { localStorage.setItem('sf_s2', JSON.stringify(S)); } catch {} };
@@ -98,35 +98,13 @@ scene.add(hemi, sun, sun.target);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 sun.shadow.bias = -0.0003;
-const shadowMat = new THREE.ShadowMaterial({ opacity: 0.55 });
-shadowMat.onBeforeCompile = (shader) => {
-  // Enhanced 12-sample Vogel Disk smoothing for wide shadow blur radii without grain
-  if (shader.fragmentShader.includes('vogelDiskSample( 0, 5, phi )')) {
-    shader.fragmentShader = shader.fragmentShader.replace(
-      /#if defined\( SHADOWMAP_TYPE_PCF \)([\s\S]*?)#elif defined\( SHADOWMAP_TYPE_VSM \)/,
-      (match) => {
-        return match.replace(
-          /\( 0, 5, phi \)([\s\S]*?)\* 0\.2;/,
-          `( 0, 12, phi ) * radius, shadowCoord.z ) ) +
-\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 1, 12, phi ) * radius, shadowCoord.z ) ) +
-\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 2, 12, phi ) * radius, shadowCoord.z ) ) +
-\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 3, 12, phi ) * radius, shadowCoord.z ) ) +
-\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 4, 12, phi ) * radius, shadowCoord.z ) ) +
-\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 5, 12, phi ) * radius, shadowCoord.z ) ) +
-\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 6, 12, phi ) * radius, shadowCoord.z ) ) +
-\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 7, 12, phi ) * radius, shadowCoord.z ) ) +
-\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 8, 12, phi ) * radius, shadowCoord.z ) ) +
-\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 9, 12, phi ) * radius, shadowCoord.z ) ) +
-\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 10, 12, phi ) * radius, shadowCoord.z ) ) +
-\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 11, 12, phi ) * radius, shadowCoord.z ) )
-\t\t\t\t) * (1.0 / 12.0);`
-        );
-      }
-    );
-  }
-};
-const SUN_DIR = new THREE.Vector3(0.35, 1, 0.5).normalize();
-const shadowPlane = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), shadowMat);
+const SUN_DIR = new THREE.Vector3();
+function setSunDir() {
+  const az = (35 + S.shRot) * Math.PI / 180, el = 1.02;
+  SUN_DIR.set(Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el));
+}
+setSunDir();
+const shadowPlane = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.ShadowMaterial({ opacity: 0.55 }));
 shadowPlane.rotation.x = -Math.PI / 2;
 shadowPlane.receiveShadow = true;
 scene.add(shadowPlane);
@@ -144,7 +122,7 @@ function updateShadow() {
   sun.target.position.copy(holder.position);
   c.near = 0.05; c.far = dist + y * 1.4 + r * 2 + 1;
   c.updateProjectionMatrix();
-  sun.shadow.normalBias = 0.01 * r;
+  sun.shadow.normalBias = 0.02 * S.shB * r;
   renderer.shadowMap.needsUpdate = true;
 }
 
@@ -168,8 +146,10 @@ addEventListener('resize', resize);
 resize();
 
 /* ---------- Цветокоррекция модели (шейдерная вставка) ---------- */
-const U = { bri: { value: 1 }, con: { value: 1 }, sat: { value: 1 }, hue: { value: 0 }, tmp: { value: 0 } };
-const GRADE = `uniform float uBri,uCon,uSat,uHue,uTmp;
+const U = { bri: { value: 1 }, con: { value: 1 }, sat: { value: 1 }, hue: { value: 0 }, tmp: { value: 0 }, fAO: { value: 0.6 }, fR: { value: 0.2 }, oAO: { value: 0.7 } };
+const GRADE = `uniform float uBri,uCon,uSat,uHue,uTmp,uFAO,uFR,uOAO;
+varying vec3 vWP,vWN;
+varying float vAO;
 vec3 grade(vec3 c){
   c*=uBri;
   c*=vec3(1.+uTmp*.25,1.+uTmp*.05,1.-uTmp*.25);
@@ -180,18 +160,29 @@ vec3 grade(vec3 c){
   return clamp(c,0.,1.);
 }
 `;
+const AOF = `#include <aomap_fragment>
+{ float oc = 1. - uOAO * (1. - vAO);
+  vec3 nw = normalize(vWN + vec3(1e-5));
+  float fc = 1. - uFAO * (1. - smoothstep(0., uFR, vWP.y)) * (.5 - .5 * nw.y);
+  float ao = clamp(oc * fc, 0., 1.);
+  reflectedLight.indirectDiffuse *= ao; reflectedLight.indirectSpecular *= ao;
+  reflectedLight.directDiffuse *= mix(1., ao, .3); }`;
 function patch(m) {
   if (m.userData.g) return;
   m.userData.g = 1;
   const prev = m.onBeforeCompile;
   m.onBeforeCompile = (sh, r) => {
     if (prev) prev.call(m, sh, r);
-    sh.uniforms.uBri = U.bri; sh.uniforms.uCon = U.con; sh.uniforms.uHue = U.hue; sh.uniforms.uTmp = U.tmp; sh.uniforms.uSat = U.sat;
+    sh.uniforms.uBri = U.bri; sh.uniforms.uCon = U.con; sh.uniforms.uHue = U.hue; sh.uniforms.uTmp = U.tmp; sh.uniforms.uSat = U.sat; sh.uniforms.uFAO = U.fAO; sh.uniforms.uFR = U.fR; sh.uniforms.uOAO = U.oAO;
+    sh.vertexShader = sh.vertexShader
+      .replace('void main() {', 'attribute float aAO;\nvarying vec3 vWP,vWN;\nvarying float vAO;\nvoid main() {')
+      .replace('#include <project_vertex>', '#include <project_vertex>\n vWP = (modelMatrix * vec4(transformed, 1.)).xyz; vWN = mat3(modelMatrix) * normal; vAO = aAO;');
     sh.fragmentShader = sh.fragmentShader
+      .replace('#include <aomap_fragment>', AOF)
       .replace('void main() {', GRADE + 'void main() {')
       .replace('#include <colorspace_fragment>', '#include <colorspace_fragment>\n gl_FragColor.rgb = grade(gl_FragColor.rgb);');
   };
-  m.customProgramCacheKey = () => 'grade1';
+  m.customProgramCacheKey = () => 'grade2';
   m.needsUpdate = true;
 }
 
@@ -226,6 +217,10 @@ function applyScene() {
   shadowPlane.visible = !!S.shadow;
   sun.castShadow = !!S.shadow;
   sun.shadow.radius = S.shR;
+  U.fAO.value = S.aoF;
+  U.oAO.value = S.aoO;
+  holder.traverse(n => { if (n.isMesh) n.receiveShadow = !!S.self; });
+  setSunDir();
   shadowDirty = true;
 }
 function bake() {
@@ -267,7 +262,7 @@ let maps = [{ name: 'Студия (встроенная)', file: '' }];
 const SL = {
   hdri: [['hdriB', 'Яркость HDRI', 0, 4], ['hdriC', 'Контраст HDRI', 0.5, 2], ['rot', 'Вращение карты', -180, 180]],
   scene: [['exp', 'Яркость сцены', 0.2, 3], ['con', 'Контраст', 0.5, 2], ['sat', 'Насыщенность', 0, 2], ['hue', 'Оттенок', -180, 180], ['tmp', 'Температура', -1, 1]],
-  shadow: [['shA', 'Сила тени', 0, 1], ['shR', 'Мягкость тени', 1, 40]]
+  shadow: [['shA', 'Сила тени', 0, 1], ['shR', 'Мягкость тени', 1, 8], ['shRot', 'Вращение тени', -180, 180], ['shB', 'Смещение тени', 0, 2], ['aoO', 'AO объекта', 0, 1.5], ['aoF', 'AO от пола', 0, 1]]
 };
 const TX = 24, TW = 812;
 function rr(x, y, w, h, r, f, s) { g.beginPath(); g.roundRect(x, y, w, h, r); if (f) { g.fillStyle = f; g.fill(); } if (s) { g.strokeStyle = s; g.lineWidth = 3; g.stroke(); } }
@@ -277,7 +272,7 @@ function btn(r, label, on, f, sz) { rr(r[0], r[1], r[2], r[3], 14, on ? '#4cc9b0
 function slider(y, d) {
   const [k, l, mn, mx] = d, v = S[k], f = (v - mn) / (mx - mn);
   tx(l, 24, y + 20, 30, '#e8e9ec', 'left', 1);
-  tx((k === 'hue' || k === 'rot') ? Math.round(v) + '°' : v.toFixed(2), 836, y + 20, 30, '#9aa0aa', 'right');
+  tx((k === 'hue' || k === 'rot' || k === 'shRot') ? Math.round(v) + '°' : v.toFixed(2), 836, y + 20, 30, '#9aa0aa', 'right');
   rr(TX, y + 56, TW, 10, 5, '#32363d'); rr(TX, y + 56, Math.max(10, TW * f), 10, 5, '#4cc9b0');
   g.beginPath(); g.arc(TX + TW * f, y + 61, 20, 0, 7); g.fillStyle = '#fff'; g.fill();
   hits.push({ r: [TX, y + 30, TW, 64], sl: d });
@@ -287,7 +282,7 @@ function resetTab() {
   const n = ['hdri', 'scene', 'shadow'][tab];
   for (const d of SL[n]) S[d[0]] = DEF[d[0]];
   if (tab === 1) S.tone = DEF.tone;
-  if (tab === 2) S.shadow = DEF.shadow;
+  if (tab === 2) { S.shadow = DEF.shadow; S.self = DEF.self; }
   applyScene(); if (tab === 0) bake(); save();
 }
 function draw() {
@@ -311,24 +306,12 @@ function draw() {
     btn([24, 590, 444, 60], `Тон-маппинг: ${S.tone ? 'вкл' : 'выкл'}`, S.tone, () => { S.tone = S.tone ? 0 : 1; applyScene(); save(); }, 28);
     btn([492, 590, 444, 60], `Высота: ${lockY === null ? 'свободна' : 'зафиксирована'}`, lockY !== null, toggleLock, 28);
   } else {
-    btn([24, 110, 912, 58], `Тень: ${S.shadow ? 'вкл' : 'выкл'}`, S.shadow, () => { S.shadow = S.shadow ? 0 : 1; applyScene(); save(); }, 28);
-    SL.shadow.forEach((d, i) => slider(184 + i * 86, d));
-    tx('Быстрые пресеты мягкости:', 24, 376, 26, '#e8e9ec');
-    const psts = [
-      { l: 'Чёткая (3)', v: 3 },
-      { l: 'Мягкая (15)', v: 15 },
-      { l: 'Очень мягкая (28)', v: 28 },
-      { l: 'Максимум (40)', v: 40 }
-    ];
-    psts.forEach((p, idx) => {
-      btn([24 + idx * 230, 404, 222, 50], p.l, Math.abs(S.shR - p.v) < 1.5, () => {
-        S.shR = p.v; applyScene(); save(); dirty = true;
-      }, 22);
-    });
-    tx('Макс. размытие увеличено до 40 с фильтрацией Vogel Disk (12 выборок).', 24, 484, 24, '#4cc9b0');
-    tx('Тень падает на пол. Если тормозит — выключите.', 24, 520, 24, '#9aa0aa');
+    btn([24, 100, 296, 52], `Тень: ${S.shadow ? 'вкл' : 'выкл'}`, S.shadow, () => { S.shadow = S.shadow ? 0 : 1; applyScene(); save(); }, 26);
+    btn([332, 100, 296, 52], `Самотени: ${S.self ? 'вкл' : 'выкл'}`, S.self, () => { S.self = S.self ? 0 : 1; applyScene(); save(); }, 26);
+    btn([640, 100, 296, 52], 'Сбросить всё', 0, resetTab, 26);
+    SL.shadow.forEach((d, i) => slider(164 + i * 84, d));
   }
-  btn(tab === 0 ? [716, 664, 220, 48] : [24, 660, 912, 50], 'Сбросить всё', 0, resetTab, 28);
+  if (tab < 2) btn(tab === 0 ? [716, 664, 220, 48] : [24, 660, 912, 50], 'Сбросить всё', 0, resetTab, 28);
 }
 
 const ray = new THREE.Raycaster(), pl = new THREE.Plane(), nrm = new THREE.Vector3(), tp = new THREE.Vector3(), tm = new THREE.Matrix4();
@@ -456,6 +439,7 @@ renderer.setAnimationLoop(() => {
   } else {
     holder.rotation.y += dt * 0.5;
   }
+  U.fR.value = Math.max(0.02, 0.3 * holder.scale.x);
   updateShadow();
   renderer.render(scene, camera);
 });
@@ -604,10 +588,12 @@ async function fetchModel(m) {
     const buf = await getBuf(f.url, f.size, `Скачиваю ${(f.size / 1048576).toFixed(1)} МБ`);
     say('Разбираю модель…');
     const gltf = info.glb ? await parseGlb(buf) : await parseZip(buf);
+    say('Считаю AO объекта…');
+    await new Promise(r => setTimeout(r, 50));
     show(gltf.scene);
     loadedUid = m.uid;
     prev.style.display = 'none';
-    say(`${m.name} — автор: ${byOf(m)}. Лицензия: ${licOf(m)}`);
+    say(`${m.name} — автор: ${byOf(m)}. Лицензия: ${licOf(m)}` + (holder.userData.aoOk === false ? ' (AO объекта пропущен: слишком тяжёлая модель)' : ''));
     return true;
   } catch (e) {
     say('Ошибка: ' + e.message + (e instanceof TypeError ? ' (возможно, браузер заблокировал запрос — сообщите мне этот текст)' : ''), true);
@@ -629,6 +615,74 @@ async function parseZip(buf) {
   mgr.setURLModifier(u => { const d = decodeURIComponent(u); for (const k in urls) if (d.endsWith(k)) return urls[k]; return u; });
   return new Promise((res, rej) => new GLTFLoader(mgr).load(urls[main], res, undefined, rej));
 }
+function bakeAO(root) {
+  const ms = [], geos = new Set();
+  root.updateWorldMatrix(true, true);
+  root.traverse(n => { if (n.isMesh && n.geometry && n.geometry.attributes.position && !geos.has(n.geometry)) { geos.add(n.geometry); ms.push(n); } });
+  let V = 0;
+  for (const m of ms) V += m.geometry.attributes.position.count;
+  if (!V) return true;
+  if (V > 300000) {
+    for (const m of ms) m.geometry.setAttribute('aAO', new THREE.BufferAttribute(new Float32Array(m.geometry.attributes.position.count).fill(1), 1));
+    return false;
+  }
+  const P = new Float32Array(V * 3), N = new Float32Array(V * 3), offs = [];
+  const v = new THREE.Vector3(), nm = new THREE.Matrix3();
+  let o = 0;
+  for (const m of ms) {
+    const geo = m.geometry;
+    if (!geo.attributes.normal) geo.computeVertexNormals();
+    const pa = geo.attributes.position, na = geo.attributes.normal;
+    nm.getNormalMatrix(m.matrixWorld);
+    offs.push(o);
+    for (let i = 0; i < pa.count; i++, o++) {
+      v.fromBufferAttribute(pa, i).applyMatrix4(m.matrixWorld);
+      P[o * 3] = v.x; P[o * 3 + 1] = v.y; P[o * 3 + 2] = v.z;
+      v.fromBufferAttribute(na, i).applyMatrix3(nm).normalize();
+      N[o * 3] = v.x; N[o * 3 + 1] = v.y; N[o * 3 + 2] = v.z;
+    }
+  }
+  const R2 = 0.12, R1 = 0.04;
+  const mn = [1e9, 1e9, 1e9], mx = [-1e9, -1e9, -1e9];
+  for (let i = 0; i < V; i++) for (let a = 0; a < 3; a++) { const t = P[i * 3 + a]; if (t < mn[a]) mn[a] = t; if (t > mx[a]) mx[a] = t; }
+  const dm = mn.map((t, a) => Math.floor((mx[a] - t) / R2) + 1);
+  const cnt = new Uint32Array(dm[0] * dm[1] * dm[2] + 1), cid = new Int32Array(V);
+  for (let i = 0; i < V; i++) {
+    const c = Math.floor((P[i * 3] - mn[0]) / R2) + dm[0] * (Math.floor((P[i * 3 + 1] - mn[1]) / R2) + dm[1] * Math.floor((P[i * 3 + 2] - mn[2]) / R2));
+    cid[i] = c; cnt[c + 1]++;
+  }
+  for (let k = 0; k < cnt.length - 1; k++) cnt[k + 1] += cnt[k];
+  const fillp = cnt.slice(), order = new Uint32Array(V);
+  for (let i = 0; i < V; i++) order[fillp[cid[i]]++] = i;
+  const ao = new Float32Array(V);
+  for (let i = 0; i < V; i++) {
+    const px = P[i * 3], py = P[i * 3 + 1], pz = P[i * 3 + 2], nx = N[i * 3], ny = N[i * 3 + 1], nz = N[i * 3 + 2];
+    const c = cid[i], cx = c % dm[0], cy = Math.floor(c / dm[0]) % dm[1], cz = Math.floor(c / (dm[0] * dm[1]));
+    let s1 = 0, w1 = 0, s2 = 0, w2 = 0;
+    for (let oz = -1; oz <= 1; oz++) {
+      const z = cz + oz; if (z < 0 || z >= dm[2]) continue;
+      for (let oy = -1; oy <= 1; oy++) {
+        const y = cy + oy; if (y < 0 || y >= dm[1]) continue;
+        for (let ox = -1; ox <= 1; ox++) {
+          const x = cx + ox; if (x < 0 || x >= dm[0]) continue;
+          const cc = x + dm[0] * (y + dm[1] * z), a = cnt[cc], b = cnt[cc + 1], st = Math.max(1, Math.ceil((b - a) / 6));
+          for (let k = a; k < b; k += st) {
+            const j = order[k]; if (j === i) continue;
+            const dx = P[j * 3] - px, dy = P[j * 3 + 1] - py, dz = P[j * 3 + 2] - pz, d2 = dx * dx + dy * dy + dz * dz;
+            if (d2 < 1e-10 || d2 > R2 * R2) continue;
+            const d = Math.sqrt(d2), q = Math.max(0, (nx * dx + ny * dy + nz * dz) / d - 0.05), wa = 1 - d / R2;
+            w2 += wa; s2 += wa * q;
+            if (d < R1) { const wb = 1 - d / R1; w1 += wb; s1 += wb * q; }
+          }
+        }
+      }
+    }
+    const f = 0.5 * (w1 ? s1 / w1 : 0) + 0.5 * (w2 ? s2 / w2 : 0);
+    ao[i] = 1 - Math.min(1, f * 1.4);
+  }
+  ms.forEach((m, i) => m.geometry.setAttribute('aAO', new THREE.BufferAttribute(ao.slice(offs[i], offs[i] + m.geometry.attributes.position.count), 1)));
+  return true;
+}
 function show(obj) {
   while (holder.children.length) {
     const old = holder.children.pop();
@@ -645,10 +699,11 @@ function show(obj) {
   obj.scale.multiplyScalar(k);
   obj.position.set(-c.x * k, -c.y * k, -c.z * k);
   holder.add(obj);
-  obj.traverse(n => { if (n.isMesh) n.castShadow = true; if (n.material) [].concat(n.material).forEach(patch); });
+  obj.traverse(n => { if (n.isMesh) { n.castShadow = true; n.receiveShadow = !!S.self; } if (n.material) [].concat(n.material).forEach(patch); });
   shadowDirty = true;
   holder.updateMatrixWorld(true);
   holder.userData.minY = new THREE.Box3().setFromObject(holder).min.y - holder.position.y;
+  holder.userData.aoOk = bakeAO(obj);
   grounded = false; lockY = null;
 }
 
