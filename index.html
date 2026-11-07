@@ -73,7 +73,7 @@ $('saveTok').onclick = () => {
 };
 
 /* ---------- Настройки (запоминаются в браузере шлема) ---------- */
-const DEF = { hdriB: 1.5, hdriC: 1, rot: 0, exp: 1.2, con: 1, sat: 1, hue: 0, tmp: 0, tone: 0, hands: 1, shadow: 1, self: 1, shA: 0.55, shR: 3, shRot: 0, shB: 0.5, aoO: 0.7, aoF: 0.6, map: '' };
+const DEF = { hdriB: 1.5, hdriC: 1, rot: 0, exp: 1.2, con: 1, sat: 1, hue: 0, tmp: 0, tone: 0, hands: 1, hShow: 1, cShow: 1, hOff: 0, shadow: 1, self: 1, vol: 0, shS: 1, shA: 0.55, shR: 3, shRot: 0, shB: 0.5, aoO: 0.7, aoF: 0.6, map: '' };
 const S = { ...DEF };
 try { Object.assign(S, JSON.parse(localStorage.getItem('sf_s2') || '{}')); } catch {}
 const save = () => { try { localStorage.setItem('sf_s2', JSON.stringify(S)); } catch {} };
@@ -145,6 +145,80 @@ function resize() {
 addEventListener('resize', resize);
 resize();
 
+/* ---------- Объёмная тень на полу ---------- */
+const SI = { value: 1 };
+shadowPlane.material.onBeforeCompile = sh => {
+  sh.uniforms.uInt = SI;
+  sh.fragmentShader = sh.fragmentShader
+    .replace('void main() {', 'uniform float uInt;\nvoid main() {')
+    .replace('getShadowMask()', '( 1.0 - ( 1.0 - getShadowMask() ) / max( uInt, 0.001 ) )');
+};
+const VR = 512;
+const mkRT = () => new THREE.WebGLRenderTarget(VR, VR, { type: THREE.HalfFloatType, depthBuffer: true });
+const rtA = mkRT(), rtB = mkRT();
+const contactCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 10);
+contactCam.layers.set(1);
+const VU = { uSh: { value: new THREE.Vector2() }, uMin: { value: 0 }, uH: { value: 1 }, uP: { value: 1.5 } };
+const contactMat = new THREE.ShaderMaterial({
+  side: THREE.DoubleSide, blending: THREE.NoBlending, uniforms: VU,
+  vertexShader: 'uniform vec2 uSh; varying float vH; void main(){ vec4 w=modelMatrix*vec4(position,1.); vH=w.y; w.xz-=uSh*w.y; gl_Position=projectionMatrix*viewMatrix*w; }',
+  fragmentShader: 'uniform float uMin,uH,uP; varying float vH; void main(){ float a=pow(1.-clamp((vH-uMin)/uH,0.,1.),uP); gl_FragColor=vec4(a,a,a,1.); }'
+});
+const blurMat = new THREE.ShaderMaterial({
+  depthTest: false, depthWrite: false, uniforms: { t: { value: null }, d: { value: new THREE.Vector2() } },
+  vertexShader: 'varying vec2 vUv; void main(){ vUv=uv; gl_Position=vec4(position.xy,0.,1.); }',
+  fragmentShader: 'uniform sampler2D t; uniform vec2 d; varying vec2 vUv; void main(){ gl_FragColor=.25*texture2D(t,vUv-d)+.5*texture2D(t,vUv)+.25*texture2D(t,vUv+d); }'
+});
+const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), blurMat);
+quad.frustumCulled = false;
+const quadScene = new THREE.Scene(); quadScene.add(quad);
+const quadCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+const VF = { t: { value: null }, uC: { value: new THREE.Vector2() }, uE: { value: 1 }, uA: { value: 0.55 } };
+const volPlane = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false, uniforms: VF,
+  vertexShader: 'varying vec2 vW; void main(){ vec4 w=modelMatrix*vec4(position,1.); vW=w.xz; gl_Position=projectionMatrix*viewMatrix*w; }',
+  fragmentShader: 'uniform sampler2D t; uniform vec2 uC; uniform float uE,uA; varying vec2 vW; void main(){ vec2 uv=vec2(.5-(vW.x-uC.x)/(2.*uE),.5-(vW.y-uC.y)/(2.*uE)); float m=step(0.,uv.x)*step(uv.x,1.)*step(0.,uv.y)*step(uv.y,1.); gl_FragColor=vec4(0.,0.,0.,texture2D(t,uv).r*uA*m); }'
+}));
+volPlane.rotation.x = -Math.PI / 2; volPlane.visible = false;
+scene.add(volPlane);
+let volDirty = true;
+const lastV = new THREE.Matrix4(), tmpCol = new THREE.Color();
+function updateVol() {
+  if (!S.shadow || !S.vol || !holder.children.length) return;
+  holder.updateMatrixWorld();
+  if (lastV.equals(holder.matrixWorld) && !volDirty) return;
+  lastV.copy(holder.matrixWorld); volDirty = false;
+  const r = 0.55 * holder.scale.x, hy = Math.max(holder.position.y, 0);
+  const sh = new THREE.Vector2(SUN_DIR.x, SUN_DIR.z).multiplyScalar(1 / SUN_DIR.y);
+  const E = r * (1 + sh.length()) * 1.15 + 0.1;
+  const cx = holder.position.x - sh.x * hy, cz = holder.position.z - sh.y * hy;
+  VU.uSh.value.copy(sh);
+  VU.uMin.value = holder.position.y + holder.scale.x * (holder.userData.minY || 0);
+  VU.uH.value = 1.6 * r;
+  contactCam.left = -E; contactCam.right = E; contactCam.top = E; contactCam.bottom = -E;
+  contactCam.near = 0; contactCam.far = hy + r * 3 + 1;
+  contactCam.position.set(cx, -0.001, cz); contactCam.up.set(0, 0, -1); contactCam.lookAt(cx, 1, cz);
+  contactCam.updateProjectionMatrix(); contactCam.updateMatrixWorld();
+  VF.uC.value.set(cx, cz); VF.uE.value = E; VF.uA.value = S.shA;
+  const xr = renderer.xr.enabled, sm = renderer.shadowMap.enabled, prevRT = renderer.getRenderTarget(), ca = renderer.getClearAlpha();
+  renderer.getClearColor(tmpCol);
+  renderer.xr.enabled = false; renderer.shadowMap.enabled = false;
+  renderer.setClearColor(0x000000, 1);
+  scene.overrideMaterial = contactMat;
+  renderer.setRenderTarget(rtA); renderer.render(scene, contactCam);
+  scene.overrideMaterial = null;
+  let src = rtA, dst = rtB;
+  const maxS = Math.max(1, S.shR / 3);
+  for (let st = 1; st <= maxS; st *= 2) for (const d of [[1, 0], [0, 1]]) {
+    blurMat.uniforms.t.value = src.texture; blurMat.uniforms.d.value.set(d[0] * st / VR, d[1] * st / VR);
+    renderer.setRenderTarget(dst); renderer.render(quadScene, quadCam);
+    const t = src; src = dst; dst = t;
+  }
+  VF.t.value = src.texture;
+  renderer.setRenderTarget(prevRT); renderer.setClearColor(tmpCol, ca);
+  renderer.xr.enabled = xr; renderer.shadowMap.enabled = sm;
+}
+
 /* ---------- Цветокоррекция модели (шейдерная вставка) ---------- */
 const U = { bri: { value: 1 }, con: { value: 1 }, sat: { value: 1 }, hue: { value: 0 }, tmp: { value: 0 }, fAO: { value: 0.6 }, fR: { value: 0.2 }, oAO: { value: 0.7 } };
 const GRADE = `uniform float uBri,uCon,uSat,uHue,uTmp,uFAO,uFR,uOAO;
@@ -163,7 +237,9 @@ vec3 grade(vec3 c){
 const AOF = `#include <aomap_fragment>
 { float oc = 1. - uOAO * (1. - vAO);
   vec3 nw = normalize(vWN + vec3(1e-5));
-  float fc = 1. - uFAO * (1. - smoothstep(0., uFR, vWP.y)) * (.5 - .5 * nw.y);
+  float t = clamp(vWP.y / uFR, 0., 1.);
+  float fo = pow(1. - t, 2.2) * (.25 + .75 * (.5 - .5 * nw.y));
+  float fc = exp(-2. * uFAO * fo);
   float ao = clamp(oc * fc, 0., 1.);
   reflectedLight.indirectDiffuse *= ao; reflectedLight.indirectSpecular *= ao;
   reflectedLight.directDiffuse *= mix(1., ao, .3); }`;
@@ -214,9 +290,14 @@ function applyScene() {
   scene.environmentIntensity = S.hdriB;
   scene.environmentRotation.y = S.rot * Math.PI / 180;
   shadowPlane.material.opacity = S.shA;
-  shadowPlane.visible = !!S.shadow;
-  sun.castShadow = !!S.shadow;
-  sun.shadow.radius = S.shR;
+  shadowPlane.visible = !!S.shadow && !S.vol;
+  volPlane.visible = !!S.shadow && !!S.vol;
+  VF.uA.value = S.shA;
+  SI.value = S.shS;
+  sun.shadow.intensity = S.shS;
+  sun.castShadow = !!S.shadow && (!S.vol || !!S.self);
+  sun.shadow.radius = Math.min(S.shR, 10);
+  volDirty = true;
   U.fAO.value = S.aoF;
   U.oAO.value = S.aoO;
   holder.traverse(n => { if (n.isMesh) n.receiveShadow = !!S.self; });
@@ -262,7 +343,8 @@ let maps = [{ name: 'Студия (встроенная)', file: '' }];
 const SL = {
   hdri: [['hdriB', 'Яркость HDRI', 0, 4], ['hdriC', 'Контраст HDRI', 0.5, 2], ['rot', 'Вращение карты', -180, 180]],
   scene: [['exp', 'Яркость сцены', 0.2, 3], ['con', 'Контраст', 0.5, 2], ['sat', 'Насыщенность', 0, 2], ['hue', 'Оттенок', -180, 180], ['tmp', 'Температура', -1, 1]],
-  shadow: [['shA', 'Сила тени', 0, 1], ['shR', 'Мягкость тени', 1, 8], ['shRot', 'Вращение тени', -180, 180], ['shB', 'Смещение тени', 0, 2], ['aoO', 'AO объекта', 0, 1.5], ['aoF', 'AO от пола', 0, 1]]
+  shadow: [['shA', 'Сила тени', 0, 1], ['shR', 'Мягкость тени', 1, 50], ['shRot', 'Вращение тени', -180, 180], ['shB', 'Смещение тени', 0, 2], ['shS', 'Сила самотеней', 0.1, 1]],
+  ao: [['aoO', 'AO объекта', 0, 1.5], ['aoF', 'AO от пола', 0, 3]]
 };
 const TX = 24, TW = 812;
 function rr(x, y, w, h, r, f, s) { g.beginPath(); g.roundRect(x, y, w, h, r); if (f) { g.fillStyle = f; g.fill(); } if (s) { g.strokeStyle = s; g.lineWidth = 3; g.stroke(); } }
@@ -278,17 +360,24 @@ function slider(y, d) {
   hits.push({ r: [TX, y + 30, TW, 64], sl: d });
   btn([852, y + 34, 84, 54], '↺', 0, () => { S[k] = DEF[k]; applyScene(); if (k === 'hdriC') bake(); save(); }, 34);
 }
+function chk(y, label, key) {
+  const on = !!S[key];
+  rr(24, y, 48, 48, 10, on ? '#4cc9b0' : '#101216', '#32363d');
+  if (on) tx('✓', 48, y + 26, 36, '#04201a', 'center', 1);
+  tx(label, 92, y + 25, 30, '#e8e9ec');
+  hits.push({ r: [24, y - 4, 912, 56], f: () => { S[key] = S[key] ? 0 : 1; applyScene(); applyHands(); save(); } });
+}
 function resetTab() {
-  const n = ['hdri', 'scene', 'shadow'][tab];
+  const n = ['hdri', 'scene', 'shadow', 'ao'][tab];
   for (const d of SL[n]) S[d[0]] = DEF[d[0]];
   if (tab === 1) S.tone = DEF.tone;
-  if (tab === 2) { S.shadow = DEF.shadow; S.self = DEF.self; }
+  if (tab === 2) { S.shadow = DEF.shadow; S.self = DEF.self; S.vol = DEF.vol; }
   applyScene(); if (tab === 0) bake(); save();
 }
 function draw() {
   g.clearRect(0, 0, CW, CH); hits = [];
   rr(2, 2, CW - 4, CH - 4, 28, '#1d2025f2', '#4cc9b0');
-  ['HDRI', 'Сцена', 'Тень', 'Руки'].forEach((n, i) => btn([24 + i * 231, 22, 219, 64], n, tab === i, () => { tab = i; }));
+  ['HDRI', 'Сцена', 'Тень', 'AO', 'Руки'].forEach((n, i) => btn([24 + i * 184, 22, 172, 64], n, tab === i, () => { tab = i; }));
   if (tab === 0) {
     const per = 4, pages = Math.max(1, Math.ceil(maps.length / per));
     page = Math.min(page, pages - 1);
@@ -309,16 +398,21 @@ function draw() {
     btn([24, 100, 296, 52], `Тень: ${S.shadow ? 'вкл' : 'выкл'}`, S.shadow, () => { S.shadow = S.shadow ? 0 : 1; applyScene(); save(); }, 26);
     btn([332, 100, 296, 52], `Самотени: ${S.self ? 'вкл' : 'выкл'}`, S.self, () => { S.self = S.self ? 0 : 1; applyScene(); save(); }, 26);
     btn([640, 100, 296, 52], 'Сбросить всё', 0, resetTab, 26);
-    SL.shadow.forEach((d, i) => slider(164 + i * 84, d));
+    chk(168, 'Объёмная тень на полу', 'vol');
+    SL.shadow.forEach((d, i) => slider(224 + i * 84, d));
+  } else if (tab === 3) {
+    SL.ao.forEach((d, i) => slider(110 + i * 90, d));
   } else {
     tx('Руки и контроллеры', 24, 130, 30, '#e8e9ec', 'left', 1);
-    [['Показывать', 1], ['Окклюзия', 2], ['Выкл', 0]].forEach(([n, v], i) => btn([24 + i * 308, 164, 296, 64], n, S.hands === v, () => { S.hands = v; applyHands(); save(); }, 28));
-    tx('Показывать — видны виртуальные руки и контроллеры.', 24, 280, 26, '#9aa0aa');
-    tx('Окклюзия — они невидимы, но закрывают модель: ваши', 24, 320, 26, '#9aa0aa');
-    tx('реальные руки и контроллеры остаются перед ней.', 24, 352, 26, '#9aa0aa');
-    tx('Руки без контроллеров появятся, когда Quest начнёт их отслеживать.', 24, 410, 26, '#9aa0aa');
+    [['Показывать', 1], ['Окклюзия', 2], ['Выкл', 0]].forEach(([n, v], i) => btn([24 + i * 308, 160, 296, 64], n, S.hands === v, () => { S.hands = v; applyHands(); save(); }, 28));
+    tx('Окклюзия — невидимые, но закрывают модель (руки спереди).', 24, 262, 26, '#9aa0aa');
+    chk(320, 'Руки (виртуальные)', 'hShow');
+    chk(390, 'Контроллеры (виртуальные)', 'cShow');
+    chk(460, 'Отключить управление руками', 'hOff');
+    tx('Щипок руками не будет двигать модель. Руки без контроллеров', 24, 560, 26, '#9aa0aa');
+    tx('появятся, когда Quest начнёт их отслеживать.', 24, 592, 26, '#9aa0aa');
   }
-  if (tab < 2) btn(tab === 0 ? [716, 664, 220, 48] : [24, 660, 912, 50], 'Сбросить всё', 0, resetTab, 28);
+  if (tab < 2 || tab === 3) btn(tab === 0 ? [716, 664, 220, 48] : [24, 660, 912, 50], 'Сбросить всё', 0, resetTab, 28);
 }
 
 const ray = new THREE.Raycaster(), pl = new THREE.Plane(), nrm = new THREE.Vector3(), tp = new THREE.Vector3(), tm = new THREE.Matrix4();
@@ -389,11 +483,12 @@ const off = new THREE.Vector3();
 for (let i = 0; i < 2; i++) {
   const c = renderer.xr.getController(i);
   c.addEventListener('connected', e => {
-    c.userData.hand = e.data.handedness;
+    c.userData.hand = e.data.handedness; c.userData.isHand = !!e.data.hand;
     if (e.data.handedness === 'left') c.add(menu);
     if (e.data.handedness === 'right') { rightC = c; c.add(rayLine); }
   });
   c.addEventListener('selectstart', () => {
+    if (S.hOff && c.userData.isHand) return;
     if (menu.visible && c.userData.hand === 'right') {
       const p = pointer(c);
       if (p.inside) { press(p, c); return; }
@@ -413,8 +508,11 @@ const handsRoot = new THREE.Group();
 scene.add(handsRoot);
 const occMat = new THREE.MeshBasicMaterial({ colorWrite: false });
 let frameN = 0;
+const cModels = [], hModels = [];
 function applyHands() {
   handsRoot.visible = S.hands !== 0;
+  cModels.forEach(m => { m.visible = !!S.cShow; });
+  hModels.forEach(m => { m.visible = !!S.hShow; });
   handsRoot.traverse(n => {
     if (!n.isMesh) return;
     if (!n.userData.m0) n.userData.m0 = n.material;
@@ -431,10 +529,10 @@ function applyHands() {
     const cf = new XRControllerModelFactory(), hf = new XRHandModelFactory();
     for (let i = 0; i < 2; i++) {
       const grip = renderer.xr.getControllerGrip(i);
-      grip.add(cf.createControllerModel(grip));
+      const cm = cf.createControllerModel(grip); cModels.push(cm); grip.add(cm);
       handsRoot.add(grip);
       const hand = renderer.xr.getHand(i);
-      hand.add(hf.createHandModel(hand, 'mesh'));
+      const hm = hf.createHandModel(hand, 'mesh'); hModels.push(hm); hand.add(hm);
       handsRoot.add(hand);
     }
   } catch (e) { console.warn('hands', e); }
@@ -479,8 +577,9 @@ renderer.setAnimationLoop(() => {
   } else {
     holder.rotation.y += dt * 0.5;
   }
-  U.fR.value = Math.max(0.02, 0.3 * holder.scale.x);
+  U.fR.value = Math.max(0.02, 0.4 * holder.scale.x);
   updateShadow();
+  updateVol();
   renderer.render(scene, camera);
 });
 
@@ -739,8 +838,8 @@ function show(obj) {
   obj.scale.multiplyScalar(k);
   obj.position.set(-c.x * k, -c.y * k, -c.z * k);
   holder.add(obj);
-  obj.traverse(n => { if (n.isMesh) { n.castShadow = true; n.receiveShadow = !!S.self; } if (n.material) [].concat(n.material).forEach(patch); });
-  shadowDirty = true;
+  obj.traverse(n => { if (n.isMesh) { n.castShadow = true; n.receiveShadow = !!S.self; n.layers.enable(1); } if (n.material) [].concat(n.material).forEach(patch); });
+  shadowDirty = true; volDirty = true;
   holder.updateMatrixWorld(true);
   holder.userData.minY = new THREE.Box3().setFromObject(holder).min.y - holder.position.y;
   holder.userData.aoOk = bakeAO(obj);
