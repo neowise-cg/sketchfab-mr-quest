@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sketchfab MR</title>
+<style>
+:root{--bg:#14161a;--panel:#1d2025;--line:#32363d;--text:#e8e9ec;--dim:#9aa0aa;--acc:#4cc9b0}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.4 system-ui,sans-serif}
+header{display:flex;gap:10px;flex-wrap:wrap;padding:14px 18px;background:var(--panel);border-bottom:1px solid var(--line)}
+input,button{font:inherit;padding:10px 14px;border-radius:8px;border:1px solid var(--line);background:#101216;color:var(--text)}
+input{flex:1;min-width:200px}
+button{cursor:pointer;background:var(--acc);color:#04201a;border:0;font-weight:600}
+button:disabled{background:var(--line);color:var(--dim);cursor:default}
+button.ghost{background:#101216;color:var(--text);border:1px solid var(--line)}
+button:focus-visible,input:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+main{display:grid;grid-template-columns:minmax(260px,1fr) minmax(300px,1fr);gap:16px;padding:16px 18px}
+@media(max-width:800px){main{grid-template-columns:1fr}}
+#grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px;align-content:start}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden;cursor:pointer;padding:0;text-align:left;color:var(--text);font-weight:400}
+.card:hover{border-color:var(--acc)}
+.card img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:#000}
+.card span{display:block;padding:6px 8px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#view{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px;position:sticky;top:12px;align-self:start}
+#wrap{width:100%;height:380px;border-radius:6px;overflow:hidden;background:#0b0c0e}
+#status{margin:10px 0;color:var(--dim);min-height:2.8em}
+#status.err{color:#ff8a7a}
+</style>
+</head>
+<body>
+<header>
+  <input id="token" type="password" placeholder="API-токен Sketchfab (вставьте один раз)" autocomplete="off">
+  <button id="saveTok" class="ghost">Сохранить токен</button>
+</header>
+<header>
+  <input id="q" type="search" placeholder="Поиск моделей, например: dragon">
+  <button id="go">Искать</button>
+</header>
+<main>
+  <div id="grid"></div>
+  <div id="view">
+    <div id="wrap"></div>
+    <div id="status">Выберите модель слева.</div>
+    <button id="mr" disabled>Войти в MR</button>
+  </div>
+</main>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script type="importmap">
+{"imports":{
+ "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+ "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+const $ = id => document.getElementById(id);
+const statusEl = $('status');
+const say = (t, err) => { statusEl.textContent = t; statusEl.className = err ? 'err' : ''; };
+const getTok = () => { try { return localStorage.getItem('sf_token') || ''; } catch { return ''; } };
+
+$('token').value = getTok();
+$('saveTok').onclick = () => {
+  try { localStorage.setItem('sf_token', $('token').value.trim()); say('Токен сохранён.'); }
+  catch { say('Не удалось сохранить токен в браузере.', true); }
+};
+
+/* ---------- Сцена ---------- */
+const wrap = $('wrap');
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setClearColor(0x0b0c0e, 1);
+renderer.xr.enabled = true;
+renderer.xr.setReferenceSpaceType('local-floor');
+wrap.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.6));
+const sun = new THREE.DirectionalLight(0xffffff, 2.2);
+sun.position.set(2, 4, 3);
+scene.add(sun);
+
+const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 50);
+const HOME = new THREE.Vector3(0, 1.0, -0.8);
+camera.position.set(0, 1.3, 0.9);
+camera.lookAt(HOME);
+
+const holder = new THREE.Group();
+holder.position.copy(HOME);
+scene.add(holder);
+
+function resize() {
+  if (renderer.xr.isPresenting) return;
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+resize();
+
+/* ---------- Управление в MR ---------- */
+let grab = null;
+const off = new THREE.Vector3();
+for (let i = 0; i < 2; i++) {
+  const c = renderer.xr.getController(i);
+  c.addEventListener('selectstart', () => {
+    grab = c;
+    off.copy(holder.position);
+    c.worldToLocal(off);
+  });
+  c.addEventListener('selectend', () => { if (grab === c) grab = null; });
+  scene.add(c);
+}
+
+const clock = new THREE.Clock();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (renderer.xr.isPresenting) {
+    if (grab) {
+      grab.updateMatrixWorld(true);
+      holder.position.copy(off).applyMatrix4(grab.matrixWorld);
+    }
+    const s = renderer.xr.getSession();
+    for (const src of s.inputSources) {
+      if (src.handedness === 'right' && src.gamepad) {
+        const a = src.gamepad.axes;
+        holder.rotation.y += (a[2] || 0) * dt * 1.6;
+        const k = 1 - (a[3] || 0) * dt * 0.9;
+        const ns = THREE.MathUtils.clamp(holder.scale.x * k, 0.05, 20);
+        holder.scale.setScalar(ns);
+      }
+    }
+  } else {
+    holder.rotation.y += dt * 0.5;
+  }
+  renderer.render(scene, camera);
+});
+
+/* ---------- Вход в MR ---------- */
+const mrBtn = $('mr');
+let hasModel = false;
+async function checkXR() {
+  if (!navigator.xr || !(await navigator.xr.isSessionSupported('immersive-ar').catch(() => false))) {
+    mrBtn.textContent = 'MR недоступен в этом браузере';
+    mrBtn.disabled = true;
+    mrBtn.dataset.na = '1';
+    return;
+  }
+  mrBtn.disabled = !hasModel;
+}
+mrBtn.onclick = async () => {
+  try {
+    const s = await navigator.xr.requestSession('immersive-ar', {
+      optionalFeatures: ['local-floor', 'hand-tracking']
+    });
+    scene.background = null;
+    renderer.setClearColor(0x000000, 0);
+    holder.position.copy(HOME);
+    s.addEventListener('end', () => { renderer.setClearColor(0x0b0c0e, 1); resize(); });
+    await renderer.xr.setSession(s);
+  } catch (e) { say('Не удалось запустить MR: ' + e.message, true); }
+};
+checkXR();
+
+/* ---------- Sketchfab ---------- */
+const API = 'https://api.sketchfab.com/v3';
+
+async function search() {
+  const q = $('q').value.trim();
+  if (!q) return say('Введите запрос.', true);
+  say('Ищу…');
+  const u = `${API}/search?type=models&downloadable=true&count=24&archives_max_face_count=150000&q=${encodeURIComponent(q)}`;
+  try {
+    const r = await fetch(u);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    const grid = $('grid');
+    grid.innerHTML = '';
+    for (const m of d.results || []) {
+      const imgs = (m.thumbnails && m.thumbnails.images) || [];
+      const img = imgs.slice().sort((a, b) => a.width - b.width).find(i => i.width >= 200) || imgs[0];
+      const b = document.createElement('button');
+      b.className = 'card';
+      b.innerHTML = `<img alt=""><span></span>`;
+      if (img) b.querySelector('img').src = img.url;
+      b.querySelector('span').textContent = m.name;
+      b.onclick = () => openModel(m);
+      grid.appendChild(b);
+    }
+    say((d.results || []).length ? 'Выберите модель.' : 'Ничего не найдено. Попробуйте другой запрос.');
+  } catch (e) { say('Ошибка поиска: ' + e.message, true); }
+}
+$('go').onclick = search;
+$('q').addEventListener('keydown', e => { if (e.key === 'Enter') search(); });
+
+async function openModel(m) {
+  const tok = getTok();
+  if (!tok) return say('Сначала вставьте API-токен вверху и нажмите «Сохранить токен».', true);
+  say(`Запрашиваю загрузку: ${m.name}…`);
+  try {
+    const r = await fetch(`${API}/models/${m.uid}/download`, { headers: { Authorization: 'Token ' + tok } });
+    if (r.status === 401 || r.status === 403) throw new Error('токен не принят');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const info = await r.json();
+    const f = info.glb || info.gltf;
+    if (!f) throw new Error('у модели нет glb/gltf');
+    say(`Скачиваю (${(f.size / 1048576).toFixed(1)} МБ)…`);
+    const fr = await fetch(f.url);
+    if (!fr.ok) throw new Error('файл: HTTP ' + fr.status);
+    const buf = await fr.arrayBuffer();
+    say('Разбираю модель…');
+    const gltf = info.glb ? await parseGlb(buf) : await parseZip(buf);
+    show(gltf.scene);
+    const by = m.user ? (m.user.displayName || m.user.username) : '?';
+    const lic = m.license && m.license.label ? m.license.label : (m.license || '');
+    say(`${m.name} — автор: ${by}. Лицензия: ${lic}`);
+    hasModel = true;
+    if (!mrBtn.dataset.na) mrBtn.disabled = false;
+  } catch (e) {
+    say('Ошибка: ' + e.message + (e instanceof TypeError ? ' (возможно, браузер заблокировал запрос — сообщите мне этот текст)' : ''), true);
+  }
+}
+
+function parseGlb(buf) {
+  return new Promise((res, rej) => new GLTFLoader().parse(buf, '', res, rej));
+}
+async function parseZip(buf) {
+  const zip = await JSZip.loadAsync(buf);
+  const urls = {};
+  let main;
+  for (const [name, f] of Object.entries(zip.files)) {
+    if (f.dir) continue;
+    urls[name] = URL.createObjectURL(await f.async('blob'));
+    if (name.endsWith('.gltf')) main = name;
+  }
+  if (!main) throw new Error('в архиве нет .gltf');
+  const mgr = new THREE.LoadingManager();
+  mgr.setURLModifier(u => {
+    const d = decodeURIComponent(u);
+    for (const k in urls) if (d.endsWith(k)) return urls[k];
+    return u;
+  });
+  return new Promise((res, rej) => new GLTFLoader(mgr).load(urls[main], res, undefined, rej));
+}
+
+function show(obj) {
+  while (holder.children.length) {
+    const old = holder.children.pop();
+    old.traverse(n => {
+      if (n.geometry) n.geometry.dispose();
+      if (n.material) [].concat(n.material).forEach(mt => { for (const k in mt) if (mt[k] && mt[k].isTexture) mt[k].dispose(); mt.dispose(); });
+    });
+  }
+  holder.scale.setScalar(1);
+  holder.rotation.set(0, 0, 0);
+  holder.position.copy(HOME);
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3());
+  const k = 0.6 / Math.max(size.x, size.y, size.z, 1e-6);
+  const c = box.getCenter(new THREE.Vector3());
+  obj.scale.multiplyScalar(k);
+  obj.position.set(-c.x * k, -c.y * k, -c.z * k);
+  holder.add(obj);
+}
+</script>
+</body>
+</html>
