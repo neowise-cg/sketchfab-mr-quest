@@ -240,7 +240,7 @@ let maps = [{ name: 'Студия (встроенная)', file: '' }];
 const SL = {
   hdri: [['hdriB', 'Яркость HDRI', 0, 4], ['hdriC', 'Контраст HDRI', 0.5, 2], ['rot', 'Вращение карты', -180, 180]],
   scene: [['exp', 'Яркость сцены', 0.2, 3], ['con', 'Контраст', 0.5, 2], ['sat', 'Насыщенность', 0, 2], ['hue', 'Оттенок', -180, 180], ['tmp', 'Температура', -1, 1]],
-  shadow: [['shA', 'Сила тени', 0, 1], ['shR', 'Мягкость тени', 1, 8]]
+  shadow: [['shA', 'Сила тени', 0, 1], ['shR', 'Мягкость тени', 1, 1000]]
 };
 const TX = 24, TW = 812;
 function rr(x, y, w, h, r, f, s) { g.beginPath(); g.roundRect(x, y, w, h, r); if (f) { g.fillStyle = f; g.fill(); } if (s) { g.strokeStyle = s; g.lineWidth = 3; g.stroke(); } }
