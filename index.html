@@ -73,7 +73,7 @@ $('saveTok').onclick = () => {
 };
 
 /* ---------- Настройки (запоминаются в браузере шлема) ---------- */
-const DEF = { hdriB: 1.5, hdriC: 1, rot: 0, exp: 1.2, con: 1, sat: 1, hue: 0, tmp: 0, tone: 0, hands: 1, hShow: 1, cShow: 1, hOff: 0, shadow: 1, self: 1, vol: 0, shS: 1, shA: 0.55, shR: 3, shRot: 0, shB: 0.5, aoO: 0.7, aoF: 0.6, map: '' };
+const DEF = { hdriB: 1.5, hdriC: 1, rot: 0, exp: 1.2, con: 1, sat: 1, hue: 0, tmp: 0, tone: 0, aoC: 1.5, hands: 1, hShow: 1, cShow: 1, hOff: 0, shadow: 1, self: 1, vol: 0, shS: 1, shA: 0.55, shR: 3, shRot: 0, shB: 0.5, aoO: 0.7, aoF: 0.6, map: '' };
 const S = { ...DEF };
 try { Object.assign(S, JSON.parse(localStorage.getItem('sf_s2') || '{}')); } catch {}
 const save = () => { try { localStorage.setItem('sf_s2', JSON.stringify(S)); } catch {} };
@@ -126,7 +126,7 @@ function updateShadow() {
   renderer.shadowMap.needsUpdate = true;
 }
 
-const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 50);
+const camera = new THREE.PerspectiveCamera(50, 1, 0.005, 50);
 const HOME = new THREE.Vector3(0, 1.0, -0.8);
 camera.position.set(0, 1.3, 0.9);
 camera.lookAt(HOME);
@@ -220,8 +220,8 @@ function updateVol() {
 }
 
 /* ---------- Цветокоррекция модели (шейдерная вставка) ---------- */
-const U = { bri: { value: 1 }, con: { value: 1 }, sat: { value: 1 }, hue: { value: 0 }, tmp: { value: 0 }, fAO: { value: 0.6 }, fR: { value: 0.2 }, oAO: { value: 0.7 } };
-const GRADE = `uniform float uBri,uCon,uSat,uHue,uTmp,uFAO,uFR,uOAO;
+const U = { bri: { value: 1 }, con: { value: 1 }, sat: { value: 1 }, hue: { value: 0 }, tmp: { value: 0 }, fAO: { value: 0.6 }, cAO: { value: 1.5 }, fR: { value: 0.2 }, oAO: { value: 0.7 } };
+const GRADE = `uniform float uBri,uCon,uSat,uHue,uTmp,uFAO,uFR,uOAO,uCAO;
 varying vec3 vWP,vWN;
 varying float vAO;
 vec3 grade(vec3 c){
@@ -240,16 +240,17 @@ const AOF = `#include <aomap_fragment>
   float t = clamp(vWP.y / uFR, 0., 1.);
   float fo = pow(1. - t, 2.2) * (.25 + .75 * (.5 - .5 * nw.y));
   float fc = exp(-2. * uFAO * fo);
-  float ao = clamp(oc * fc, 0., 1.);
+  float fb = exp(-8. * uCAO * (1. - smoothstep(0., .035, vWP.y)) * (.35 + .65 * (.5 - .5 * nw.y)));
+  float ao = clamp(oc * fc * fb, 0., 1.);
   reflectedLight.indirectDiffuse *= ao; reflectedLight.indirectSpecular *= ao;
-  reflectedLight.directDiffuse *= mix(1., ao, .3); }`;
+  reflectedLight.directDiffuse *= mix(1., oc * fc, .3) * mix(1., fb, .8); }`;
 function patch(m) {
   if (m.userData.g) return;
   m.userData.g = 1;
   const prev = m.onBeforeCompile;
   m.onBeforeCompile = (sh, r) => {
     if (prev) prev.call(m, sh, r);
-    sh.uniforms.uBri = U.bri; sh.uniforms.uCon = U.con; sh.uniforms.uHue = U.hue; sh.uniforms.uTmp = U.tmp; sh.uniforms.uSat = U.sat; sh.uniforms.uFAO = U.fAO; sh.uniforms.uFR = U.fR; sh.uniforms.uOAO = U.oAO;
+    sh.uniforms.uBri = U.bri; sh.uniforms.uCon = U.con; sh.uniforms.uHue = U.hue; sh.uniforms.uTmp = U.tmp; sh.uniforms.uSat = U.sat; sh.uniforms.uFAO = U.fAO; sh.uniforms.uFR = U.fR; sh.uniforms.uOAO = U.oAO; sh.uniforms.uCAO = U.cAO;
     sh.vertexShader = sh.vertexShader
       .replace('void main() {', 'attribute float aAO;\nvarying vec3 vWP,vWN;\nvarying float vAO;\nvoid main() {')
       .replace('#include <project_vertex>', '#include <project_vertex>\n vWP = (modelMatrix * vec4(transformed, 1.)).xyz; vWN = mat3(modelMatrix) * normal; vAO = aAO;');
@@ -300,6 +301,7 @@ function applyScene() {
   volDirty = true;
   U.fAO.value = S.aoF;
   U.oAO.value = S.aoO;
+  U.cAO.value = S.aoC;
   holder.traverse(n => { if (n.isMesh) n.receiveShadow = !!S.self; });
   setSunDir();
   shadowDirty = true;
@@ -343,8 +345,8 @@ let maps = [{ name: 'Студия (встроенная)', file: '' }];
 const SL = {
   hdri: [['hdriB', 'Яркость HDRI', 0, 4], ['hdriC', 'Контраст HDRI', 0.5, 2], ['rot', 'Вращение карты', -180, 180]],
   scene: [['exp', 'Яркость сцены', 0.2, 3], ['con', 'Контраст', 0.5, 2], ['sat', 'Насыщенность', 0, 2], ['hue', 'Оттенок', -180, 180], ['tmp', 'Температура', -1, 1]],
-  shadow: [['shA', 'Сила тени', 0, 1], ['shR', 'Мягкость тени', 1, 50], ['shRot', 'Вращение тени', -180, 180], ['shB', 'Смещение тени', 0, 2], ['shS', 'Сила самотеней', 0.1, 1]],
-  ao: [['aoO', 'AO объекта', 0, 1.5], ['aoF', 'AO от пола', 0, 3]]
+  shadow: [['shA', 'Сила тени', 0, 1], ['shR', 'Мягкость тени', 1, 50], ['shRot', 'Вращение тени', -180, 180], ['shB', 'Смещение тени', 0, 2], ['shS', 'Сила самотеней', 0.1, 20]],
+  ao: [['aoO', 'AO объекта', 0, 1.5], ['aoF', 'AO от пола', 0, 3], ['aoC', 'Затемнение у пола (3 см)', 0, 5]]
 };
 const TX = 24, TW = 812;
 function rr(x, y, w, h, r, f, s) { g.beginPath(); g.roundRect(x, y, w, h, r); if (f) { g.fillStyle = f; g.fill(); } if (s) { g.strokeStyle = s; g.lineWidth = 3; g.stroke(); } }
