@@ -26,6 +26,7 @@ main{display:grid;grid-template-columns:minmax(260px,1fr) minmax(300px,1fr);gap:
 #wrap{width:100%;height:380px;border-radius:6px;overflow:hidden;background:#0b0c0e}
 #status{margin:10px 0;color:var(--dim);min-height:2.8em}
 #status.err{color:#ff8a7a}
+#hint{color:var(--dim);font-size:14px;margin:10px 0 0}
 </style>
 </head>
 <body>
@@ -43,15 +44,15 @@ main{display:grid;grid-template-columns:minmax(260px,1fr) minmax(300px,1fr);gap:
     <div id="wrap"></div>
     <div id="status">Выберите модель слева.</div>
     <button id="mr" disabled>Войти в MR</button>
-    <p id="hint" style="color:var(--dim);font-size:14px;margin:10px 0 0">В MR: курок — переносить, A — поставить на пол, левый стик — вращение, правый стик — размер.</p>
+    <p id="hint">В MR: курок — переносить, A — поставить на пол, левый стик — вращение, правый стик — размер, Y (левый контроллер) — меню освещения; в меню нажимайте правым курком.</p>
   </div>
 </main>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script type="importmap">
 {"imports":{
- "three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
- "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}
+ "three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+ "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"}}
 </script>
 <script type="module">
 import * as THREE from 'three';
@@ -62,12 +63,17 @@ const $ = id => document.getElementById(id);
 const statusEl = $('status');
 const say = (t, err) => { statusEl.textContent = t; statusEl.className = err ? 'err' : ''; };
 const getTok = () => { try { return localStorage.getItem('sf_token') || ''; } catch { return ''; } };
-
 $('token').value = getTok();
 $('saveTok').onclick = () => {
   try { localStorage.setItem('sf_token', $('token').value.trim()); say('Токен сохранён.'); }
   catch { say('Не удалось сохранить токен в браузере.', true); }
 };
+
+/* ---------- Настройки (запоминаются в браузере шлема) ---------- */
+const DEF = { hdriB: 1.5, hdriC: 1, exp: 1.2, con: 1, hue: 0, tmp: 0, tone: 1, est: 1, map: '' };
+const S = { ...DEF };
+try { Object.assign(S, JSON.parse(localStorage.getItem('sf_s') || '{}')); } catch {}
+const save = () => { try { localStorage.setItem('sf_s', JSON.stringify(S)); } catch {} };
 
 /* ---------- Сцена ---------- */
 const wrap = $('wrap');
@@ -79,14 +85,10 @@ renderer.xr.setReferenceSpaceType('local-floor');
 wrap.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
-renderer.toneMapping = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 1.0;
-const pmrem = new THREE.PMREMGenerator(renderer);
-scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.04).texture;
-scene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 0.6));
-const sun = new THREE.DirectionalLight(0xffffff, 1.4);
+const hemi = new THREE.HemisphereLight(0xffffff, 0x445566, 0.5);
+const sun = new THREE.DirectionalLight(0xffffff, 1.0);
 sun.position.set(2, 4, 3);
-scene.add(sun);
+scene.add(hemi, sun);
 
 const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 50);
 const HOME = new THREE.Vector3(0, 1.0, -0.8);
@@ -107,20 +109,232 @@ function resize() {
 addEventListener('resize', resize);
 resize();
 
-/* ---------- Управление в MR ---------- */
-let grab = null;
-let grounded = false, aPrev = false;
+/* ---------- Цветокоррекция модели (шейдерная вставка) ---------- */
+const U = { bri: { value: 1 }, con: { value: 1 }, hue: { value: 0 }, tmp: { value: 0 } };
+const GRADE = `uniform float uBri,uCon,uHue,uTmp;
+vec3 grade(vec3 c){
+  c*=uBri;
+  c*=vec3(1.+uTmp*.25,1.+uTmp*.05,1.-uTmp*.25);
+  float cs=cos(uHue),sn=sin(uHue); vec3 k=vec3(.57735);
+  c=c*cs+cross(k,c)*sn+k*dot(k,c)*(1.-cs);
+  c=(c-.5)*uCon+.5;
+  return clamp(c,0.,1.);
+}
+`;
+function patch(m) {
+  if (m.userData.g) return;
+  m.userData.g = 1;
+  const prev = m.onBeforeCompile;
+  m.onBeforeCompile = (sh, r) => {
+    if (prev) prev.call(m, sh, r);
+    sh.uniforms.uBri = U.bri; sh.uniforms.uCon = U.con; sh.uniforms.uHue = U.hue; sh.uniforms.uTmp = U.tmp;
+    sh.fragmentShader = sh.fragmentShader
+      .replace('void main() {', GRADE + 'void main() {')
+      .replace('#include <colorspace_fragment>', '#include <colorspace_fragment>\n gl_FragColor.rgb = grade(gl_FragColor.rgb);');
+  };
+  m.customProgramCacheKey = () => 'grade1';
+  m.needsUpdate = true;
+}
+
+/* ---------- Окружение: HDRI / студия / свет комнаты ---------- */
+const pmrem = new THREE.PMREMGenerator(renderer);
+let envRT = null, curTex = null, xrLight = null, estOn = false;
+const envMat = new THREE.ShaderMaterial({
+  side: THREE.BackSide, depthWrite: false,
+  uniforms: { map: { value: null }, k: { value: 1 } },
+  vertexShader: 'varying vec3 d; void main(){ d=position; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.); }',
+  fragmentShader: 'uniform sampler2D map; uniform float k; varying vec3 d; void main(){ vec3 n=normalize(d); vec2 uv=vec2(atan(n.z,n.x)*0.15915494+0.5, asin(clamp(n.y,-1.,1.))*0.31830989+0.5); vec3 c=texture2D(map,uv).rgb; c=pow(max(c,0.)/0.18,vec3(k))*0.18; gl_FragColor=vec4(c,1.); }'
+});
+const envScene = new THREE.Scene();
+envScene.add(new THREE.Mesh(new THREE.SphereGeometry(10, 48, 24), envMat));
+
+function applyEnv() {
+  const est = estOn && S.est && xrLight;
+  scene.environment = (est && xrLight.environment) || (envRT && envRT.texture) || null;
+  scene.environmentIntensity = S.hdriB;
+  hemi.visible = sun.visible = !est;
+}
+function applyScene() {
+  const t = !!S.tone;
+  renderer.toneMapping = t ? THREE.NeutralToneMapping : THREE.NoToneMapping;
+  renderer.toneMappingExposure = t ? S.exp : 1;
+  U.bri.value = t ? 1 : S.exp;
+  U.con.value = S.con;
+  U.hue.value = S.hue * Math.PI / 180;
+  U.tmp.value = S.tmp;
+  scene.environmentIntensity = S.hdriB;
+}
+function bake() {
+  let rt;
+  if (curTex) { envMat.uniforms.map.value = curTex; envMat.uniforms.k.value = S.hdriC; rt = pmrem.fromScene(envScene, 0, 0.1, 100); }
+  else rt = pmrem.fromScene(new RoomEnvironment(renderer), 0.04);
+  if (envRT) envRT.dispose();
+  envRT = rt;
+  applyEnv();
+}
+async function loadTex(url) {
+  const ext = url.split('.').pop().toLowerCase();
+  const u = url.split('/').map(encodeURIComponent).join('/');
+  let t;
+  if (ext === 'hdr') { const { RGBELoader } = await import('three/addons/loaders/RGBELoader.js'); t = await new RGBELoader().loadAsync(u); }
+  else if (ext === 'exr') { const { EXRLoader } = await import('three/addons/loaders/EXRLoader.js'); t = await new EXRLoader().loadAsync(u); }
+  else { t = await new THREE.TextureLoader().loadAsync(u); t.colorSpace = THREE.SRGBColorSpace; }
+  t.wrapS = THREE.RepeatWrapping; t.minFilter = THREE.LinearFilter; t.generateMipmaps = false;
+  return t;
+}
+(async () => {
+  try {
+    const { XREstimatedLight } = await import('three/addons/webxr/XREstimatedLight.js');
+    xrLight = new XREstimatedLight(renderer, true);
+    xrLight.addEventListener('estimationstart', () => { estOn = true; scene.add(xrLight); applyEnv(); dirty = true; });
+    xrLight.addEventListener('estimationend', () => { estOn = false; scene.remove(xrLight); applyEnv(); dirty = true; });
+  } catch (e) { xrLight = null; }
+})();
+
+/* ---------- Меню освещения в VR ---------- */
+const CW = 960, CH = 720, PW = 0.38, PH = PW * CH / CW;
+const cv = document.createElement('canvas'); cv.width = CW; cv.height = CH;
+const g = cv.getContext('2d');
+const tex = new THREE.CanvasTexture(cv); tex.colorSpace = THREE.SRGBColorSpace;
+const menu = new THREE.Group(); menu.visible = false;
+menu.position.set(0, 0.13, -0.06); menu.rotation.x = -Math.PI / 2 + 0.6;
+const panel = new THREE.Mesh(new THREE.PlaneGeometry(PW, PH), new THREE.MeshBasicMaterial({ map: tex, transparent: true, side: THREE.DoubleSide, toneMapped: false }));
+panel.renderOrder = 9;
+menu.add(panel);
+const dot = new THREE.Mesh(new THREE.SphereGeometry(0.006), new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false, depthTest: false }));
+dot.visible = false; dot.renderOrder = 10; scene.add(dot);
+const rayLine = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -0.7)]), new THREE.LineBasicMaterial({ color: 0x4cc9b0 }));
+rayLine.visible = false;
+
+let hits = [], dirty = true, page = 0, tab = 0, msg = '', drag = null, rightC = null;
+let maps = [{ name: 'Студия (встроенная)', file: '' }];
+const SL = {
+  hdri: [['hdriB', 'Яркость HDRI', 0, 4], ['hdriC', 'Контраст HDRI', 0.5, 2]],
+  scene: [['exp', 'Яркость сцены', 0.2, 3], ['con', 'Контраст', 0.5, 2], ['hue', 'Оттенок', -180, 180], ['tmp', 'Температура', -1, 1]]
+};
+
+function rr(x, y, w, h, r, f, s) { g.beginPath(); g.roundRect(x, y, w, h, r); if (f) { g.fillStyle = f; g.fill(); } if (s) { g.strokeStyle = s; g.lineWidth = 3; g.stroke(); } }
+function tx(s, x, y, sz, c, al, b) { g.font = `${b ? 600 : 400} ${sz}px system-ui,sans-serif`; g.fillStyle = c; g.textAlign = al || 'left'; g.textBaseline = 'middle'; g.fillText(s, x, y); }
+function fit(s, w) { g.font = '600 30px system-ui,sans-serif'; if (g.measureText(s).width <= w) return s; let t = s; while (t.length > 2 && g.measureText(t + '…').width > w) t = t.slice(0, -1); return t + '…'; }
+function btn(r, label, on, f, sz) { rr(r[0], r[1], r[2], r[3], 14, on ? '#4cc9b0' : '#101216', '#32363d'); tx(label, r[0] + r[2] / 2, r[1] + r[3] / 2, sz || 30, on ? '#04201a' : '#e8e9ec', 'center', on); hits.push({ r, f }); }
+function slider(y, d) {
+  const [k, l, mn, mx] = d, v = S[k], f = (v - mn) / (mx - mn);
+  tx(l, 24, y + 20, 30, '#e8e9ec', 'left', 1);
+  tx(k === 'hue' ? Math.round(v) + '°' : v.toFixed(2), 936, y + 20, 30, '#9aa0aa', 'right');
+  rr(24, y + 56, 912, 10, 5, '#32363d'); rr(24, y + 56, Math.max(10, 912 * f), 10, 5, '#4cc9b0');
+  g.beginPath(); g.arc(24 + 912 * f, y + 61, 20, 0, 7); g.fillStyle = '#fff'; g.fill();
+  hits.push({ r: [24, y + 30, 912, 64], sl: d });
+}
+function estTxt() { return !xrLight ? 'недоступно' : estOn ? (S.est ? 'работает' : 'есть данные, выключено') : 'шлем не передаёт данные'; }
+
+function draw() {
+  g.clearRect(0, 0, CW, CH); hits = [];
+  rr(2, 2, CW - 4, CH - 4, 28, '#1d2025f2', '#4cc9b0');
+  ['HDRI', 'Сцена'].forEach((n, i) => btn([24 + i * 468, 22, 444, 64], n, tab === i, () => { tab = i; }));
+  const reset = () => { for (const d of SL[tab ? 'scene' : 'hdri']) S[d[0]] = DEF[d[0]]; applyScene(); if (!tab) bake(); save(); };
+  if (!tab) {
+    const per = 4, pages = Math.max(1, Math.ceil(maps.length / per));
+    page = Math.min(page, pages - 1);
+    tx(`Карты HDRI: ${maps.length - 1}`, 24, 118, 28, '#9aa0aa');
+    if (pages > 1) {
+      btn([700, 96, 80, 44], '◀', 0, () => { page = (page + pages - 1) % pages; }, 26);
+      tx(`${page + 1}/${pages}`, 820, 118, 26, '#9aa0aa', 'center');
+      btn([860, 96, 76, 44], '▶', 0, () => { page = (page + 1) % pages; }, 26);
+    }
+    maps.slice(page * per, page * per + per).forEach((m, i) => btn([24, 148 + i * 62, 912, 54], fit(m.name, 860), S.map === m.file, () => pickMap(m)));
+    SL.hdri.forEach((d, i) => slider(410 + i * 98, d));
+    tx(fit(msg || (maps.length < 2 ? 'Положите .hdr/.exr рядом с index.html на GitHub' : ''), 640), 24, 636, 26, '#ff8a7a');
+  } else {
+    SL.scene.forEach((d, i) => slider(106 + i * 96, d));
+    btn([24, 500, 444, 60], `Тон-маппинг: ${S.tone ? 'вкл' : 'выкл'}`, S.tone, () => { S.tone = S.tone ? 0 : 1; applyScene(); save(); }, 28);
+    btn([492, 500, 444, 60], `Свет комнаты: ${S.est ? 'вкл' : 'выкл'}`, S.est, () => { S.est = S.est ? 0 : 1; applyEnv(); save(); }, 28);
+    tx('Свет комнаты (авто): ' + estTxt(), 24, 600, 26, '#9aa0aa');
+  }
+  btn([700, 612, 236, 56], 'Сброс', 0, reset, 28);
+}
+
+const ray = new THREE.Raycaster(), pl = new THREE.Plane(), nrm = new THREE.Vector3(), tp = new THREE.Vector3(), tm = new THREE.Matrix4();
+function pointer(c) {
+  panel.updateWorldMatrix(true, false); c.updateWorldMatrix(true, false);
+  tm.extractRotation(c.matrixWorld);
+  ray.ray.origin.setFromMatrixPosition(c.matrixWorld);
+  ray.ray.direction.set(0, 0, -1).applyMatrix4(tm);
+  nrm.set(0, 0, 1).transformDirection(panel.matrixWorld);
+  tp.setFromMatrixPosition(panel.matrixWorld);
+  pl.setFromNormalAndCoplanarPoint(nrm, tp);
+  const hit = ray.ray.intersectPlane(pl, new THREE.Vector3());
+  if (!hit) return { inside: false };
+  const l = panel.worldToLocal(hit.clone());
+  return { inside: Math.abs(l.x) <= PW / 2 && Math.abs(l.y) <= PH / 2, px: (l.x / PW + 0.5) * CW, py: (0.5 - l.y / PH) * CH, world: hit };
+}
+function setSl(px) {
+  const [k, , mn, mx] = drag.sl;
+  S[k] = mn + (mx - mn) * Math.min(1, Math.max(0, (px - 24) / 912));
+  applyScene();
+}
+function press(p, c) {
+  for (const h of hits) {
+    const [x, y, w, hh] = h.r;
+    if (p.px >= x && p.px <= x + w && p.py >= y && p.py <= y + hh) {
+      if (h.sl) { drag = { c, sl: h.sl }; setSl(p.px); } else h.f();
+      dirty = true; return;
+    }
+  }
+}
+async function pickMap(m) {
+  S.map = m.file; save(); msg = ''; dirty = true;
+  if (!m.file) { curTex = null; bake(); return; }
+  msg = 'Загрузка…';
+  try {
+    const t = await loadTex(m.file);
+    if (S.map !== m.file) return;
+    if (curTex) curTex.dispose();
+    curTex = t; bake(); msg = '';
+  } catch (e) { msg = 'Не загрузилась (подождите 1–2 мин после загрузки на GitHub)'; }
+  dirty = true;
+}
+async function discover() {
+  const ok = /\.(hdr|exr|jpe?g|png|webp)$/i;
+  const o = location.hostname.split('.')[0], r = location.pathname.split('/')[1];
+  const found = [];
+  for (const d of ['hdri', '']) {
+    try {
+      const x = await fetch(`https://api.github.com/repos/${o}/${r}/contents/${d}`);
+      if (!x.ok) continue;
+      for (const f of await x.json()) if (f.type === 'file' && ok.test(f.name)) found.push({ name: f.name.replace(/\.[^.]+$/, ''), file: (d ? d + '/' : '') + f.name });
+    } catch {}
+  }
+  if (!found.length) {
+    try { const x = await fetch('hdri/list.json'); if (x.ok) for (const n of await x.json()) found.push({ name: n.replace(/\.[^.]+$/, ''), file: 'hdri/' + n }); } catch {}
+  }
+  maps = [maps[0], ...found]; dirty = true;
+  const m = maps.find(m => m.file && m.file === S.map);
+  if (m) pickMap(m);
+}
+
+/* ---------- Контроллеры ---------- */
+let grab = null, grounded = false, aPrev = false, yPrev = false;
 const groundSnap = () => { holder.position.y = -holder.scale.x * (holder.userData.minY || 0); };
 const off = new THREE.Vector3();
 for (let i = 0; i < 2; i++) {
   const c = renderer.xr.getController(i);
-  c.addEventListener('selectstart', () => {
-    grab = c;
-    grounded = false;
-    off.copy(holder.position);
-    c.worldToLocal(off);
+  c.addEventListener('connected', e => {
+    c.userData.hand = e.data.handedness;
+    if (e.data.handedness === 'left') c.add(menu);
+    if (e.data.handedness === 'right') { rightC = c; c.add(rayLine); }
   });
-  c.addEventListener('selectend', () => { if (grab === c) grab = null; });
+  c.addEventListener('selectstart', () => {
+    if (menu.visible && c.userData.hand === 'right') {
+      const p = pointer(c);
+      if (p.inside) { press(p, c); return; }
+    }
+    grab = c; grounded = false;
+    off.copy(holder.position); c.worldToLocal(off);
+  });
+  c.addEventListener('selectend', () => {
+    if (drag && drag.c === c) { if (drag.sl[0] === 'hdriC') bake(); save(); drag = null; return; }
+    if (grab === c) grab = null;
+  });
   scene.add(c);
 }
 
@@ -128,25 +342,33 @@ const clock = new THREE.Clock();
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
   if (renderer.xr.isPresenting) {
-    if (grab) {
-      grab.updateMatrixWorld(true);
-      holder.position.copy(off).applyMatrix4(grab.matrixWorld);
-    }
-    const s = renderer.xr.getSession();
-    for (const src of s.inputSources) {
+    if (grab) { grab.updateMatrixWorld(true); holder.position.copy(off).applyMatrix4(grab.matrixWorld); }
+    for (const src of renderer.xr.getSession().inputSources) {
       if (!src.gamepad) continue;
-      const a = src.gamepad.axes;
+      const a = src.gamepad.axes, b = src.gamepad.buttons;
       if (src.handedness === 'left') {
         holder.rotation.y += (a[2] || 0) * dt * 1.6;
+        const yNow = !!(b[5] && b[5].pressed);
+        if (yNow && !yPrev) { menu.visible = !menu.visible; rayLine.visible = menu.visible; dot.visible = false; dirty = true; }
+        yPrev = yNow;
       } else if (src.handedness === 'right') {
         const k = 1 - (a[3] || 0) * dt * 0.9;
         holder.scale.setScalar(THREE.MathUtils.clamp(holder.scale.x * k, 0.05, 20));
-        const aNow = !!(src.gamepad.buttons[4] && src.gamepad.buttons[4].pressed);
-        if (aNow && !aPrev) { grounded = true; }
+        const aNow = !!(b[4] && b[4].pressed);
+        if (aNow && !aPrev) grounded = true;
         aPrev = aNow;
       }
     }
     if (grounded) groundSnap();
+    if (menu.visible) {
+      if (rightC) {
+        const p = pointer(rightC);
+        dot.visible = !!p.inside;
+        if (p.inside) dot.position.copy(p.world);
+        if (drag) { const q = pointer(drag.c); if (q.px !== undefined) { setSl(q.px); dirty = true; } }
+      }
+      if (dirty) { draw(); tex.needsUpdate = true; dirty = false; }
+    }
   } else {
     holder.rotation.y += dt * 0.5;
   }
@@ -159,21 +381,18 @@ let hasModel = false;
 async function checkXR() {
   if (!navigator.xr || !(await navigator.xr.isSessionSupported('immersive-ar').catch(() => false))) {
     mrBtn.textContent = 'MR недоступен в этом браузере';
-    mrBtn.disabled = true;
-    mrBtn.dataset.na = '1';
+    mrBtn.disabled = true; mrBtn.dataset.na = '1';
     return;
   }
   mrBtn.disabled = !hasModel;
 }
 mrBtn.onclick = async () => {
   try {
-    const s = await navigator.xr.requestSession('immersive-ar', {
-      optionalFeatures: ['local-floor', 'hand-tracking']
-    });
+    const s = await navigator.xr.requestSession('immersive-ar', { optionalFeatures: ['local-floor', 'hand-tracking', 'light-estimation'] });
     scene.background = null;
     renderer.setClearColor(0x000000, 0);
     holder.position.copy(HOME);
-    s.addEventListener('end', () => { renderer.setClearColor(0x0b0c0e, 1); resize(); });
+    s.addEventListener('end', () => { renderer.setClearColor(0x0b0c0e, 1); menu.visible = false; rayLine.visible = false; dot.visible = false; resize(); });
     await renderer.xr.setSession(s);
   } catch (e) { say('Не удалось запустить MR: ' + e.message, true); }
 };
@@ -181,7 +400,6 @@ checkXR();
 
 /* ---------- Sketchfab ---------- */
 const API = 'https://api.sketchfab.com/v3';
-
 async function search() {
   const q = $('q').value.trim();
   if (!q) return say('Введите запрос.', true);
@@ -237,10 +455,7 @@ async function openModel(m) {
     say('Ошибка: ' + e.message + (e instanceof TypeError ? ' (возможно, браузер заблокировал запрос — сообщите мне этот текст)' : ''), true);
   }
 }
-
-function parseGlb(buf) {
-  return new Promise((res, rej) => new GLTFLoader().parse(buf, '', res, rej));
-}
+function parseGlb(buf) { return new Promise((res, rej) => new GLTFLoader().parse(buf, '', res, rej)); }
 async function parseZip(buf) {
   const zip = await JSZip.loadAsync(buf);
   const urls = {};
@@ -252,14 +467,9 @@ async function parseZip(buf) {
   }
   if (!main) throw new Error('в архиве нет .gltf');
   const mgr = new THREE.LoadingManager();
-  mgr.setURLModifier(u => {
-    const d = decodeURIComponent(u);
-    for (const k in urls) if (d.endsWith(k)) return urls[k];
-    return u;
-  });
+  mgr.setURLModifier(u => { const d = decodeURIComponent(u); for (const k in urls) if (d.endsWith(k)) return urls[k]; return u; });
   return new Promise((res, rej) => new GLTFLoader(mgr).load(urls[main], res, undefined, rej));
 }
-
 function show(obj) {
   while (holder.children.length) {
     const old = holder.children.pop();
@@ -268,9 +478,7 @@ function show(obj) {
       if (n.material) [].concat(n.material).forEach(mt => { for (const k in mt) if (mt[k] && mt[k].isTexture) mt[k].dispose(); mt.dispose(); });
     });
   }
-  holder.scale.setScalar(1);
-  holder.rotation.set(0, 0, 0);
-  holder.position.copy(HOME);
+  holder.scale.setScalar(1); holder.rotation.set(0, 0, 0); holder.position.copy(HOME);
   const box = new THREE.Box3().setFromObject(obj);
   const size = box.getSize(new THREE.Vector3());
   const k = 0.6 / Math.max(size.x, size.y, size.z, 1e-6);
@@ -278,10 +486,15 @@ function show(obj) {
   obj.scale.multiplyScalar(k);
   obj.position.set(-c.x * k, -c.y * k, -c.z * k);
   holder.add(obj);
+  obj.traverse(n => { if (n.material) [].concat(n.material).forEach(patch); });
   holder.updateMatrixWorld(true);
   holder.userData.minY = new THREE.Box3().setFromObject(holder).min.y - holder.position.y;
   grounded = false;
 }
+
+applyScene();
+bake();
+discover();
 </script>
 </body>
 </html>
