@@ -98,8 +98,35 @@ scene.add(hemi, sun, sun.target);
 sun.castShadow = true;
 sun.shadow.mapSize.set(2048, 2048);
 sun.shadow.bias = -0.0003;
+const shadowMat = new THREE.ShadowMaterial({ opacity: 0.55 });
+shadowMat.onBeforeCompile = (shader) => {
+  // Enhanced 12-sample Vogel Disk smoothing for wide shadow blur radii without grain
+  if (shader.fragmentShader.includes('vogelDiskSample( 0, 5, phi )')) {
+    shader.fragmentShader = shader.fragmentShader.replace(
+      /#if defined\( SHADOWMAP_TYPE_PCF \)([\s\S]*?)#elif defined\( SHADOWMAP_TYPE_VSM \)/,
+      (match) => {
+        return match.replace(
+          /\( 0, 5, phi \)([\s\S]*?)\* 0\.2;/,
+          `( 0, 12, phi ) * radius, shadowCoord.z ) ) +
+\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 1, 12, phi ) * radius, shadowCoord.z ) ) +
+\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 2, 12, phi ) * radius, shadowCoord.z ) ) +
+\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 3, 12, phi ) * radius, shadowCoord.z ) ) +
+\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 4, 12, phi ) * radius, shadowCoord.z ) ) +
+\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 5, 12, phi ) * radius, shadowCoord.z ) ) +
+\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 6, 12, phi ) * radius, shadowCoord.z ) ) +
+\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 7, 12, phi ) * radius, shadowCoord.z ) ) +
+\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 8, 12, phi ) * radius, shadowCoord.z ) ) +
+\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 9, 12, phi ) * radius, shadowCoord.z ) ) +
+\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 10, 12, phi ) * radius, shadowCoord.z ) ) +
+\t\t\t\t\ttexture( shadowMap, vec3( shadowCoord.xy + vogelDiskSample( 11, 12, phi ) * radius, shadowCoord.z ) )
+\t\t\t\t) * (1.0 / 12.0);`
+        );
+      }
+    );
+  }
+};
 const SUN_DIR = new THREE.Vector3(0.35, 1, 0.5).normalize();
-const shadowPlane = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.ShadowMaterial({ opacity: 0.55 }));
+const shadowPlane = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), shadowMat);
 shadowPlane.rotation.x = -Math.PI / 2;
 shadowPlane.receiveShadow = true;
 scene.add(shadowPlane);
@@ -240,7 +267,7 @@ let maps = [{ name: 'Студия (встроенная)', file: '' }];
 const SL = {
   hdri: [['hdriB', 'Яркость HDRI', 0, 4], ['hdriC', 'Контраст HDRI', 0.5, 2], ['rot', 'Вращение карты', -180, 180]],
   scene: [['exp', 'Яркость сцены', 0.2, 3], ['con', 'Контраст', 0.5, 2], ['sat', 'Насыщенность', 0, 2], ['hue', 'Оттенок', -180, 180], ['tmp', 'Температура', -1, 1]],
-  shadow: [['shA', 'Сила тени', 0, 1], ['shR', 'Мягкость тени', 1, 1000]]
+  shadow: [['shA', 'Сила тени', 0, 1], ['shR', 'Мягкость тени', 1, 40]]
 };
 const TX = 24, TW = 812;
 function rr(x, y, w, h, r, f, s) { g.beginPath(); g.roundRect(x, y, w, h, r); if (f) { g.fillStyle = f; g.fill(); } if (s) { g.strokeStyle = s; g.lineWidth = 3; g.stroke(); } }
@@ -284,9 +311,22 @@ function draw() {
     btn([24, 590, 444, 60], `Тон-маппинг: ${S.tone ? 'вкл' : 'выкл'}`, S.tone, () => { S.tone = S.tone ? 0 : 1; applyScene(); save(); }, 28);
     btn([492, 590, 444, 60], `Высота: ${lockY === null ? 'свободна' : 'зафиксирована'}`, lockY !== null, toggleLock, 28);
   } else {
-    btn([24, 120, 912, 64], `Тень: ${S.shadow ? 'вкл' : 'выкл'}`, S.shadow, () => { S.shadow = S.shadow ? 0 : 1; applyScene(); save(); }, 30);
-    SL.shadow.forEach((d, i) => slider(214 + i * 90, d));
-    tx('Тень падает на пол. Если тормозит — выключите.', 24, 460, 26, '#9aa0aa');
+    btn([24, 110, 912, 58], `Тень: ${S.shadow ? 'вкл' : 'выкл'}`, S.shadow, () => { S.shadow = S.shadow ? 0 : 1; applyScene(); save(); }, 28);
+    SL.shadow.forEach((d, i) => slider(184 + i * 86, d));
+    tx('Быстрые пресеты мягкости:', 24, 376, 26, '#e8e9ec');
+    const psts = [
+      { l: 'Чёткая (3)', v: 3 },
+      { l: 'Мягкая (15)', v: 15 },
+      { l: 'Очень мягкая (28)', v: 28 },
+      { l: 'Максимум (40)', v: 40 }
+    ];
+    psts.forEach((p, idx) => {
+      btn([24 + idx * 230, 404, 222, 50], p.l, Math.abs(S.shR - p.v) < 1.5, () => {
+        S.shR = p.v; applyScene(); save(); dirty = true;
+      }, 22);
+    });
+    tx('Макс. размытие увеличено до 40 с фильтрацией Vogel Disk (12 выборок).', 24, 484, 24, '#4cc9b0');
+    tx('Тень падает на пол. Если тормозит — выключите.', 24, 520, 24, '#9aa0aa');
   }
   btn(tab === 0 ? [716, 664, 220, 48] : [24, 660, 912, 50], 'Сбросить всё', 0, resetTab, 28);
 }
