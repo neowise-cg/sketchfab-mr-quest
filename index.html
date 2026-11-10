@@ -18,7 +18,22 @@ button:focus-visible,input:focus-visible{outline:2px solid var(--acc);outline-of
 main{display:grid;grid-template-columns:minmax(260px,1fr) minmax(300px,1fr);gap:16px;padding:16px 18px}
 @media(max-width:800px){main{grid-template-columns:1fr}}
 #grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:10px;align-content:start}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden;cursor:pointer;padding:0;text-align:left;color:var(--text);font-weight:400}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden;cursor:pointer;padding:0;text-align:left;color:var(--text);font-weight:400;position:relative}
+.card:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+.acts{position:absolute;top:6px;right:6px;display:flex;gap:6px}
+.cbtn{width:34px;height:34px;padding:0;border-radius:50%;background:#000b;color:#fff;border:1px solid #fff3;font-size:17px;line-height:1;display:grid;place-items:center}
+.cbtn.on{color:#ff6b81}
+#favBtn{position:absolute;top:8px;right:8px;z-index:3;display:none}
+.tabs{display:flex;gap:8px;flex-wrap:wrap;padding:12px 18px 0}
+.tab{background:#101216;color:var(--text);border:1px solid var(--line)}
+.tab.on{background:var(--acc);color:#04201a;border-color:var(--acc)}
+#bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin-bottom:12px;color:var(--dim)}
+#bar button{background:#3a1d1d;color:#ffb4a8;border:1px solid #6b2d2d}
+#modal{position:fixed;inset:0;background:#000a;display:flex;align-items:center;justify-content:center;z-index:50;padding:20px}
+#modal[hidden]{display:none}
+#modal .box{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px;max-width:420px}
+#modal .row{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+#modal #myes{background:#c0392b;color:#fff}
 .card:hover{border-color:var(--acc)}
 .card img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:#000}
 .card span{display:block;padding:6px 8px;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -41,16 +56,22 @@ main{display:grid;grid-template-columns:minmax(260px,1fr) minmax(300px,1fr);gap:
   <input id="q" type="search" placeholder="Поиск моделей, например: dragon">
   <button id="go">Искать</button>
 </header>
+<nav class="tabs">
+  <button class="tab on" data-v="search">Поиск</button>
+  <button class="tab" id="tDl" data-v="dl">Загруженное</button>
+  <button class="tab" id="tFav" data-v="fav">Избранное</button>
+</nav>
 <main>
-  <div><div id="grid"></div><div id="pager"></div></div>
+  <div><div id="bar"></div><div id="grid"></div><div id="pager"></div></div>
   <div id="view">
-    <div id="wrap"><img id="prev" alt=""></div>
+    <div id="wrap"><img id="prev" alt=""><button id="favBtn" class="cbtn" title="Избранное">♡</button></div>
     <div id="status">Выберите модель слева.</div>
     <button id="mr" disabled>Войти в MR</button>
     <p id="hint">В MR: курок — переносить, A — поставить на пол, B — зафиксировать/отпустить высоту, левый стик — вращение, правый стик — размер, Y (левый контроллер) — меню освещения; в меню нажимайте правым курком.</p>
   </div>
 </main>
 
+<div id="modal" hidden><div class="box"><p id="mtext"></p><div class="row"><button id="mno" class="ghost">Отмена</button><button id="myes">Удалить</button></div></div></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script type="importmap">
 {"imports":{
@@ -297,7 +318,7 @@ function applyScene() {
   SI.value = S.shS;
   sun.shadow.intensity = S.shS;
   sun.castShadow = !!S.shadow && (!S.vol || !!S.self);
-  sun.shadow.radius = Math.min(S.shR, 10);
+  sun.shadow.radius = S.shR;
   volDirty = true;
   U.fAO.value = S.aoF;
   U.oAO.value = S.aoO;
@@ -625,31 +646,163 @@ const imgs = m => ((m.thumbnails && m.thumbnails.images) || []).slice().sort((a,
 const licOf = m => (m.license && m.license.label) ? m.license.label : (m.license || '');
 const byOf = m => m.user ? (m.user.displayName || m.user.username) : '?';
 
+/* ---------- Память: скачанное и избранное (IndexedDB) ---------- */
+const meta = new Map();
+let idb = null, storeOk = false, view = 'search', searchState = { list: [], hasNext: false }, blobUrls = [];
+const rq = r => new Promise((res, rej) => { r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+const fin = t => new Promise((res, rej) => { t.oncomplete = res; t.onerror = t.onabort = () => rej(t.error); });
+const idbReady = (async () => {
+  try {
+    idb = await new Promise((res, rej) => {
+      const o = indexedDB.open('sfmr', 1);
+      o.onupgradeneeded = () => { o.result.createObjectStore('meta', { keyPath: 'uid' }); o.result.createObjectStore('blobs'); };
+      o.onsuccess = () => res(o.result); o.onerror = () => rej(o.error);
+    });
+    (await rq(idb.transaction('meta').objectStore('meta').getAll())).forEach(r => meta.set(r.uid, r));
+    storeOk = true;
+  } catch { storeOk = false; }
+})();
+async function dbPut(store, v, k) { if (!storeOk) return; const t = idb.transaction(store, 'readwrite'); const o = t.objectStore(store); if (k === undefined) o.put(v); else o.put(v, k); await fin(t); }
+async function dbDel(store, k) { if (!storeOk) return; const t = idb.transaction(store, 'readwrite'); t.objectStore(store).delete(k); await fin(t); }
+async function dbClearBlobs() { if (!storeOk) return; const t = idb.transaction('blobs', 'readwrite'); t.objectStore('blobs').clear(); await fin(t); }
+async function getBlob(uid) { return storeOk ? rq(idb.transaction('blobs').objectStore('blobs').get(uid)) : null; }
+
+const isFav = u => !!(meta.get(u) && meta.get(u).favAt);
+const isDl = u => !!(meta.get(u) && meta.get(u).dlAt);
+function slim(m) {
+  const im = imgs(m), small = im.find(i => i.width >= 200) || im[0], big = im.filter(i => i.width <= 1024).pop() || im[im.length - 1];
+  const list = [];
+  if (small) list.push({ url: small.url, width: small.width });
+  if (big && big !== small) list.push({ url: big.url, width: big.width });
+  return { uid: m.uid, name: m.name, user: { displayName: m.user && m.user.displayName, username: m.user && m.user.username }, license: licOf(m), thumbnails: { images: list }, isDownloadable: m.isDownloadable, favAt: 0, dlAt: 0 };
+}
+async function toggleFav(m) {
+  const r = meta.get(m.uid) || slim(m);
+  r.favAt = r.favAt ? 0 : Date.now();
+  meta.set(r.uid, r);
+  try {
+    if (!r.favAt && !r.dlAt) { meta.delete(r.uid); await dbDel('meta', r.uid); } else await dbPut('meta', r);
+  } catch { say('Не удалось сохранить избранное в память браузера.', true); }
+  setView(view);
+}
+async function dropDl(uid) {
+  const r = meta.get(uid);
+  if (!r) return;
+  try { await dbDel('blobs', uid); } catch {}
+  r.dlAt = 0; r.size = 0;
+  try {
+    if (!r.favAt) { meta.delete(uid); await dbDel('meta', uid); } else await dbPut('meta', r);
+  } catch {}
+}
+async function saveDownload(m, buf, glb) {
+  if (!storeOk) return;
+  try {
+    const r = meta.get(m.uid) || slim(m);
+    r.dlAt = Date.now(); r.size = buf.byteLength; r.glb = glb;
+    if (!r.thumbBlob) { try { const im = imgs(r)[0]; if (im) { const x = await fetch(im.url); if (x.ok) r.thumbBlob = await x.blob(); } } catch {} }
+    await dbPut('blobs', new Blob([buf]), m.uid);
+    await dbPut('meta', r);
+    meta.set(r.uid, r);
+    if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
+    setView(view);
+  } catch (e) { say('Модель открыта, но не сохранилась в память: ' + (e && e.name ? e.name : e), true); }
+}
+function confirmBox(text) {
+  return new Promise(res => {
+    $('mtext').textContent = text; $('modal').hidden = false;
+    $('mno').onclick = () => { $('modal').hidden = true; res(false); };
+    $('myes').onclick = () => { $('modal').hidden = true; res(true); };
+  });
+}
+async function deleteAll() {
+  const dl = [...meta.values()].filter(r => r.dlAt);
+  if (!dl.length) return;
+  const mb = (dl.reduce((a, r) => a + (r.size || 0), 0) / 1048576).toFixed(1);
+  if (!(await confirmBox(`Удалить все скачанные модели (${dl.length} шт., ${mb} МБ)? Это нельзя отменить. Избранное останется.`))) return;
+  try { await dbClearBlobs(); } catch {}
+  for (const r of dl) await dropDl(r.uid);
+  setView(view);
+  say('Все скачанные модели удалены из памяти.');
+}
+function updFav() {
+  const b = $('favBtn');
+  b.style.display = sel ? 'grid' : 'none';
+  const on = !!(sel && isFav(sel.uid));
+  b.textContent = on ? '♥' : '♡'; b.classList.toggle('on', on);
+}
+$('favBtn').onclick = () => { if (sel) toggleFav(sel); };
+prev.onerror = () => { const r = sel && meta.get(sel.uid); if (r && r.thumbBlob) prev.src = URL.createObjectURL(r.thumbBlob); };
+
 function selectModel(m) {
-  if (m.isDownloadable === false) { sel = null; setBtn(); return say('У этой модели автор отключил скачивание — её нельзя открыть.', true); }
+  if (m.isDownloadable === false) { sel = null; setBtn(); updFav(); return say('У этой модели автор отключил скачивание — её нельзя открыть.', true); }
   sel = m;
   mrBtn.textContent = 'Войти в MR';
   const big = imgs(m).filter(i => i.width <= 1024).pop() || imgs(m).pop();
   if (m.uid === loadedUid) prev.style.display = 'none';
   else if (big) { prev.src = big.url; prev.style.display = 'block'; }
-  say(`${m.name} — автор: ${byOf(m)}. Лицензия: ${licOf(m)}. Нажмите «Войти в MR»: модель скачается и запустится.`);
-  setBtn();
+  say(`${m.name} — автор: ${byOf(m)}. Лицензия: ${licOf(m)}. Нажмите «Войти в MR»: модель ${isDl(m.uid) ? 'откроется из памяти' : 'скачается'} и запустится.`);
+  setBtn(); updFav();
 }
-function renderGrid(list) {
+function mkAct(t, title, on, f) {
+  const x = document.createElement('button');
+  x.className = 'cbtn' + (on ? ' on' : ''); x.textContent = t; x.title = title;
+  x.onclick = e => { e.stopPropagation(); f(); };
+  return x;
+}
+function renderGrid(list, empty) {
+  blobUrls.forEach(u => URL.revokeObjectURL(u)); blobUrls = [];
   const grid = $('grid');
   grid.innerHTML = '';
+  if (!list.length && empty) {
+    const p = document.createElement('p');
+    p.style.cssText = 'color:var(--dim);grid-column:1/-1;margin:0';
+    p.textContent = empty; grid.appendChild(p);
+    return;
+  }
   for (const m of list) {
-    const im = imgs(m);
-    const img = im.find(i => i.width >= 200) || im[0];
-    const b = document.createElement('button');
-    b.className = 'card';
-    b.innerHTML = `<img alt=""><span></span>`;
-    if (img) b.querySelector('img').src = img.url;
+    const im = imgs(m), img = im.find(i => i.width >= 200) || im[0];
+    const b = document.createElement('div');
+    b.className = 'card'; b.tabIndex = 0; b.setAttribute('role', 'button');
+    b.innerHTML = '<img alt=""><span></span><div class="acts"></div>';
+    const ie = b.querySelector('img');
+    if (m.thumbBlob) { const u = URL.createObjectURL(m.thumbBlob); blobUrls.push(u); ie.src = u; }
+    else if (img) ie.src = img.url;
     b.querySelector('span').textContent = m.name;
+    const acts = b.querySelector('.acts');
+    acts.appendChild(mkAct(isFav(m.uid) ? '♥' : '♡', 'Избранное', isFav(m.uid), () => toggleFav(m)));
+    if (isDl(m.uid)) acts.appendChild(mkAct('🗑', 'Удалить из памяти', false, async () => { await dropDl(m.uid); setView(view); }));
     b.onclick = () => selectModel(m);
+    b.onkeydown = e => { if (e.key === 'Enter') selectModel(m); };
     grid.appendChild(b);
   }
 }
+function setView(v) {
+  view = v;
+  document.querySelectorAll('.tab').forEach(b => b.classList.toggle('on', b.dataset.v === v));
+  const all = [...meta.values()], nd = all.filter(r => r.dlAt), nf = all.filter(r => r.favAt);
+  $('tDl').textContent = `Загруженное (${nd.length})`;
+  $('tFav').textContent = `Избранное (${nf.length})`;
+  const bar = $('bar'), pg = $('pager');
+  bar.innerHTML = ''; pg.innerHTML = '';
+  if (v === 'search') { renderGrid(searchState.list, ''); renderPager(searchState.hasNext); }
+  else if (v === 'dl') {
+    nd.sort((a, b) => b.dlAt - a.dlAt);
+    renderGrid(nd, 'Скачанных моделей пока нет. Модель сохраняется в память, когда вы нажимаете «Войти в MR».');
+    if (nd.length) {
+      const mb = (nd.reduce((a, r) => a + (r.size || 0), 0) / 1048576).toFixed(1);
+      const sp = document.createElement('span'); sp.textContent = `${nd.length} шт. · ${mb} МБ`;
+      const bt = document.createElement('button'); bt.textContent = 'Удалить все'; bt.onclick = deleteAll;
+      bar.append(sp, bt);
+    }
+  } else {
+    nf.sort((a, b) => b.favAt - a.favAt);
+    renderGrid(nf, 'В избранном пусто. Нажмите ♡ на карточке модели.');
+  }
+  updFav();
+}
+document.querySelectorAll('.tab').forEach(b => { b.onclick = () => setView(b.dataset.v); });
+idbReady.then(() => setView(view));
+
 let pageUrls = [], pageIdx = 0;
 function renderPager(hasNext) {
   const pg = $('pager');
@@ -667,8 +820,8 @@ async function loadPage(i) {
     const d = await r.json();
     pageIdx = i;
     if (d.next) pageUrls[i + 1] = d.next; else pageUrls.length = i + 1;
-    renderGrid(d.results || []);
-    renderPager(!!d.next);
+    searchState = { list: d.results || [], hasNext: !!d.next };
+    setView('search');
     say((d.results || []).length ? 'Выберите модель.' : 'Ничего не найдено. Попробуйте другой запрос.');
     scrollTo({ top: 0 });
   } catch (e) { say('Ошибка поиска: ' + e.message, true); }
@@ -681,7 +834,8 @@ async function byLink(uid) {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const m = await r.json();
     pageUrls = []; pageIdx = 0;
-    renderGrid([m]); renderPager(false);
+    searchState = { list: [m], hasNext: false };
+    setView('search');
     say(m.isDownloadable === false ? 'Модель найдена, но автор отключил скачивание.' : 'Модель найдена. Нажмите на неё в списке.', m.isDownloadable === false);
   } catch (e) { say('Ошибка: ' + e.message, true); }
 }
@@ -716,25 +870,37 @@ async function getBuf(url, total, label) {
   return out.buffer;
 }
 async function fetchModel(m) {
-  const tok = getTok();
-  if (!tok) { say('Сначала вставьте API-токен вверху и нажмите «Сохранить токен».', true); return false; }
-  say(`Запрашиваю загрузку: ${m.name}…`);
   try {
-    const r = await fetch(`${API}/models/${m.uid}/download`, { headers: { Authorization: 'Token ' + tok } });
-    if (r.status === 401 || r.status === 403) throw new Error('токен не принят');
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const info = await r.json();
-    const f = info.glb || info.gltf;
-    if (!f) throw new Error('у модели нет glb/gltf');
-    const buf = await getBuf(f.url, f.size, `Скачиваю ${(f.size / 1048576).toFixed(1)} МБ`);
+    let buf = null, glb = false, cached = false;
+    if (isDl(m.uid)) {
+      try {
+        const bl = await getBlob(m.uid);
+        if (bl) { say(`Загружаю из памяти: ${m.name}…`); buf = await bl.arrayBuffer(); glb = !!meta.get(m.uid).glb; cached = true; }
+        else { await dropDl(m.uid); setView(view); }
+      } catch { buf = null; }
+    }
+    if (!buf) {
+      const tok = getTok();
+      if (!tok) { say('Сначала вставьте API-токен вверху и нажмите «Сохранить токен».', true); return false; }
+      say(`Запрашиваю загрузку: ${m.name}…`);
+      const r = await fetch(`${API}/models/${m.uid}/download`, { headers: { Authorization: 'Token ' + tok } });
+      if (r.status === 401 || r.status === 403) throw new Error('токен не принят');
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const info = await r.json();
+      const f = info.glb || info.gltf;
+      if (!f) throw new Error('у модели нет glb/gltf');
+      glb = !!info.glb;
+      buf = await getBuf(f.url, f.size, `Скачиваю ${(f.size / 1048576).toFixed(1)} МБ`);
+    }
     say('Разбираю модель…');
-    const gltf = info.glb ? await parseGlb(buf) : await parseZip(buf);
+    const gltf = glb ? await parseGlb(buf) : await parseZip(buf);
     say('Считаю AO объекта…');
     await new Promise(r => setTimeout(r, 50));
     show(gltf.scene);
     loadedUid = m.uid;
     prev.style.display = 'none';
-    say(`${m.name} — автор: ${byOf(m)}. Лицензия: ${licOf(m)}` + (holder.userData.aoOk === false ? ' (AO объекта пропущен: слишком тяжёлая модель)' : ''));
+    say(`${m.name} — автор: ${byOf(m)}. Лицензия: ${licOf(m)}` + (cached ? ' (из памяти)' : '') + (holder.userData.aoOk === false ? ' (AO объекта пропущен: слишком тяжёлая модель)' : ''));
+    if (!cached) saveDownload(m, buf, glb);
     return true;
   } catch (e) {
     say('Ошибка: ' + e.message + (e instanceof TypeError ? ' (возможно, браузер заблокировал запрос — сообщите мне этот текст)' : ''), true);
